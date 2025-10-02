@@ -27,6 +27,19 @@ License
 #include "fvModels.H"
 #include "fvConstraints.H"
 #include "bound.H"
+#include "Switch.H"
+
+#include <algorithm>
+#include <cctype>
+#include <sstream>
+#include <string>
+
+#ifdef FOAM_USE_CUDA
+#include <cuda.h>
+#include <nvrtc.h>
+#include <mutex>
+#include <vector>
+#endif
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -35,12 +48,555 @@ namespace Foam
 namespace RASModels
 {
 
+#ifdef FOAM_USE_CUDA
+namespace
+{
+
+inline std::string cudaErrorMessage(const char* prefix, const CUresult code)
+{
+    const char* msg = nullptr;
+    cuGetErrorString(code, &msg);
+
+    std::ostringstream os;
+    os << prefix;
+    if (msg)
+    {
+        os << msg;
+    }
+    else
+    {
+        os << "unknown CUDA error";
+    }
+    os << " (" << static_cast<int>(code) << ')';
+    return os.str();
+}
+
+
+inline std::string nvrtcErrorMessage
+(
+    const char* prefix,
+    const nvrtcResult code
+)
+{
+    std::ostringstream os;
+    os << prefix << nvrtcGetErrorString(code) << " (" << static_cast<int>(code)
+       << ')';
+    return os.str();
+}
+
+
+class kEpsilonCudaBackend
+{
+    std::mutex mutex_;
+    bool contextInitialised_;
+    bool kernelReady_;
+    int deviceId_;
+    CUcontext context_;
+    CUmodule module_;
+    CUfunction correctNutKernel_;
+
+    void cleanupLocked()
+    {
+        if (module_)
+        {
+            cuModuleUnload(module_);
+            module_ = nullptr;
+        }
+
+        if (context_)
+        {
+            cuCtxDestroy(context_);
+            context_ = nullptr;
+        }
+
+        contextInitialised_ = false;
+        kernelReady_ = false;
+        deviceId_ = -1;
+    }
+
+    bool compileKernel(const int deviceId, std::string& errorMessage)
+    {
+        CUdevice device;
+        CUresult status = cuDeviceGet(&device, deviceId);
+
+        if (status != CUDA_SUCCESS)
+        {
+            errorMessage = cudaErrorMessage("cuDeviceGet: ", status);
+            return false;
+        }
+
+        int major = 0;
+        int minor = 0;
+        status = cuDeviceComputeCapability(&major, &minor, device);
+
+        if (status != CUDA_SUCCESS)
+        {
+            errorMessage = cudaErrorMessage("cuDeviceComputeCapability: ", status);
+            return false;
+        }
+
+        std::ostringstream arch;
+        arch << "--gpu-architecture=compute_" << major << minor;
+
+        const std::string scalarName =
+            sizeof(scalar) == sizeof(float) ? "float" : "double";
+
+        std::ostringstream source;
+        source
+            << "extern \"C\" __global__ void correctNutKernel("
+            << scalarName << "* __restrict__ nut,"
+            << " const " << scalarName << "* __restrict__ k,"
+            << " const " << scalarName << "* __restrict__ epsilon,"
+            << ' ' << scalarName << " Cmu,"
+            << ' ' << scalarName << " kMin,"
+            << ' ' << scalarName << " epsilonMin,"
+            << " int n)\n"
+            << "{\n"
+            << "    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+            << "    if (idx < n)\n    {\n"
+            << "        " << scalarName << " kval = k[idx];\n"
+            << "        if (kval < kMin) kval = kMin;\n"
+            << "        " << scalarName << " eps = epsilon[idx];\n"
+            << "        if (eps < epsilonMin) eps = epsilonMin;\n"
+            << "        " << scalarName << " value = Cmu * kval * kval / eps;\n"
+            << "        nut[idx] = value;\n"
+            << "    }\n"
+            << "}\n";
+
+        nvrtcProgram prog;
+        nvrtcResult nvStatus = nvrtcCreateProgram
+        (
+            &prog,
+            source.str().c_str(),
+            "kEpsilonCorrectNut.cu",
+            0,
+            nullptr,
+            nullptr
+        );
+
+        if (nvStatus != NVRTC_SUCCESS)
+        {
+            errorMessage = nvrtcErrorMessage("nvrtcCreateProgram: ", nvStatus);
+            return false;
+        }
+
+        std::vector<std::string> optionStorage;
+        optionStorage.emplace_back("--std=c++14");
+        optionStorage.emplace_back("--fmad=false");
+        optionStorage.emplace_back(arch.str());
+
+        std::vector<const char*> options;
+        options.reserve(optionStorage.size());
+        for (const std::string& opt : optionStorage)
+        {
+            options.push_back(opt.c_str());
+        }
+
+        nvStatus = nvrtcCompileProgram(prog, options.size(), options.data());
+
+        if (nvStatus != NVRTC_SUCCESS)
+        {
+            size_t logSize = 0;
+            nvrtcGetProgramLogSize(prog, &logSize);
+            std::string log(logSize, '\0');
+            if (logSize > 1)
+            {
+                nvrtcGetProgramLog(prog, log.data());
+            }
+            nvrtcDestroyProgram(&prog);
+
+            std::ostringstream os;
+            os << "nvrtcCompileProgram: " << nvrtcGetErrorString(nvStatus);
+            if (!log.empty())
+            {
+                os << '\n' << log;
+            }
+            errorMessage = os.str();
+            return false;
+        }
+
+        size_t ptxSize = 0;
+        nvrtcGetPTXSize(prog, &ptxSize);
+        std::string ptx(ptxSize, '\0');
+        nvrtcGetPTX(prog, ptx.data());
+        nvrtcDestroyProgram(&prog);
+
+        status = cuModuleLoadDataEx(&module_, ptx.c_str(), 0, nullptr, nullptr);
+        if (status != CUDA_SUCCESS)
+        {
+            errorMessage = cudaErrorMessage("cuModuleLoadDataEx: ", status);
+            return false;
+        }
+
+        status = cuModuleGetFunction(&correctNutKernel_, module_, "correctNutKernel");
+        if (status != CUDA_SUCCESS)
+        {
+            errorMessage = cudaErrorMessage("cuModuleGetFunction: ", status);
+            return false;
+        }
+
+        kernelReady_ = true;
+        return true;
+    }
+
+public:
+
+    kEpsilonCudaBackend()
+    :
+        mutex_(),
+        contextInitialised_(false),
+        kernelReady_(false),
+        deviceId_(-1),
+        context_(nullptr),
+        module_(nullptr),
+        correctNutKernel_(nullptr)
+    {}
+
+    ~kEpsilonCudaBackend()
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        cleanupLocked();
+    }
+
+    bool prepare(const int requestedDeviceId, std::string& message)
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        message.clear();
+
+        if (kernelReady_ && contextInitialised_ && requestedDeviceId == deviceId_)
+        {
+            cuCtxSetCurrent(context_);
+            return true;
+        }
+
+        cleanupLocked();
+
+        CUresult status = cuInit(0);
+        if (status != CUDA_SUCCESS)
+        {
+            message = cudaErrorMessage("cuInit: ", status);
+            return false;
+        }
+
+        int deviceCount = 0;
+        status = cuDeviceGetCount(&deviceCount);
+        if (status != CUDA_SUCCESS)
+        {
+            message = cudaErrorMessage("cuDeviceGetCount: ", status);
+            return false;
+        }
+
+        if (deviceCount <= 0)
+        {
+            message = "No CUDA devices detected";
+            return false;
+        }
+
+        int selectedDevice = requestedDeviceId;
+        if (selectedDevice < 0 || selectedDevice >= deviceCount)
+        {
+            selectedDevice = ((selectedDevice % deviceCount) + deviceCount) % deviceCount;
+        }
+
+        CUdevice device;
+        status = cuDeviceGet(&device, selectedDevice);
+        if (status != CUDA_SUCCESS)
+        {
+            message = cudaErrorMessage("cuDeviceGet: ", status);
+            return false;
+        }
+
+        status = cuCtxCreate(&context_, 0, device);
+        if (status != CUDA_SUCCESS)
+        {
+            message = cudaErrorMessage("cuCtxCreate: ", status);
+            return false;
+        }
+
+        contextInitialised_ = true;
+        deviceId_ = selectedDevice;
+
+        if (!compileKernel(selectedDevice, message))
+        {
+            cleanupLocked();
+            return false;
+        }
+
+        return kernelReady_;
+    }
+
+    bool launchCorrectNut
+    (
+        scalar* nut,
+        const scalar* k,
+        const scalar* epsilon,
+        const label nCells,
+        const scalar Cmu,
+        const scalar kMin,
+        const scalar epsilonMin
+    )
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+
+        if (!kernelReady_ || !contextInitialised_)
+        {
+            return false;
+        }
+
+        cuCtxSetCurrent(context_);
+
+        const size_t bytes = nCells*sizeof(scalar);
+
+        CUdeviceptr dNut = 0;
+        CUdeviceptr dK = 0;
+        CUdeviceptr dEps = 0;
+
+        CUresult status = cuMemAlloc(&dNut, bytes);
+        if (status != CUDA_SUCCESS)
+        {
+            return false;
+        }
+
+        status = cuMemAlloc(&dK, bytes);
+        if (status != CUDA_SUCCESS)
+        {
+            cuMemFree(dNut);
+            return false;
+        }
+
+        status = cuMemAlloc(&dEps, bytes);
+        if (status != CUDA_SUCCESS)
+        {
+            cuMemFree(dNut);
+            cuMemFree(dK);
+            return false;
+        }
+
+        bool ok = true;
+
+        status = cuMemcpyHtoD(dK, k, bytes);
+        ok = ok && status == CUDA_SUCCESS;
+        status = cuMemcpyHtoD(dEps, epsilon, bytes);
+        ok = ok && status == CUDA_SUCCESS;
+
+        if (!ok)
+        {
+            cuMemFree(dNut);
+            cuMemFree(dK);
+            cuMemFree(dEps);
+            return false;
+        }
+
+        const int threadsPerBlock = 256;
+        const int blocks = static_cast<int>
+        (
+            (nCells + threadsPerBlock - 1)/threadsPerBlock
+        );
+
+        int nCellsInt = static_cast<int>(nCells);
+        scalar kernelCmu = Cmu;
+        scalar kernelKmin = kMin;
+        scalar kernelEpsilonMin = epsilonMin;
+
+        void* args[] =
+        {
+            &dNut,
+            &dK,
+            &dEps,
+            &kernelCmu,
+            &kernelKmin,
+            &kernelEpsilonMin,
+            &nCellsInt
+        };
+
+        status = cuLaunchKernel
+        (
+            correctNutKernel_,
+            blocks, 1, 1,
+            threadsPerBlock, 1, 1,
+            0,
+            nullptr,
+            args,
+            nullptr
+        );
+
+        ok = ok && status == CUDA_SUCCESS;
+
+        if (ok)
+        {
+            status = cuCtxSynchronize();
+            ok = ok && status == CUDA_SUCCESS;
+        }
+
+        if (ok)
+        {
+            status = cuMemcpyDtoH(nut, dNut, bytes);
+            ok = ok && status == CUDA_SUCCESS;
+        }
+
+        cuMemFree(dNut);
+        cuMemFree(dK);
+        cuMemFree(dEps);
+
+        return ok;
+    }
+};
+
+
+inline kEpsilonCudaBackend& getKepsilonCudaBackend()
+{
+    static kEpsilonCudaBackend backend;
+    return backend;
+}
+
+#endif
+
+template<class BasicMomentumTransportModel>
+void kEpsilon<BasicMomentumTransportModel>::refreshGpuConfig()
+{
+    bool requestedGpu = false;
+
+    Switch gpuSwitch(false);
+    if (gpuSwitch.readIfPresent("useGPU", this->coeffDict_))
+    {
+        requestedGpu = gpuSwitch;
+    }
+
+    const auto normaliseDeviceWord = [](word backend) -> std::string
+    {
+        std::string result(backend);
+        std::transform
+        (
+            result.begin(),
+            result.end(),
+            result.begin(),
+            [](unsigned char c){ return std::tolower(c); }
+        );
+        return result;
+    };
+
+    if (!requestedGpu)
+    {
+        const word backend = this->coeffDict_.template lookupOrDefault<word>
+        (
+            "device",
+            "cpu"
+        );
+
+        const std::string backendLower = normaliseDeviceWord(backend);
+        requestedGpu = backendLower == "gpu" || backendLower == "cuda";
+    }
+
+    if (!requestedGpu && this->coeffDict_.found("backend"))
+    {
+        const word altBackend = this->coeffDict_.template lookup<word>("backend");
+        const std::string backendLower = normaliseDeviceWord(altBackend);
+        requestedGpu = backendLower == "gpu" || backendLower == "cuda";
+    }
+
+    useGpu_ = requestedGpu;
+
+    gpuDeviceId_ = this->coeffDict_.template lookupOrDefault<label>("gpuDevice", gpuDeviceId_);
+    gpuDeviceId_ = this->coeffDict_.template lookupOrDefault<label>("deviceId", gpuDeviceId_);
+
+    gpuOperational_ = useGpu_;
+
+#ifndef FOAM_USE_CUDA
+    if (useGpu_)
+    {
+        WarningInFunction
+            << "kEpsilon GPU backend requested but this build lacks CUDA support" << nl
+            << "Continuing with CPU implementation." << endl;
+        useGpu_ = false;
+        gpuOperational_ = false;
+    }
+#endif
+}
+
 // * * * * * * * * * * * * Protected Member Functions  * * * * * * * * * * * //
 
 template<class BasicMomentumTransportModel>
 void kEpsilon<BasicMomentumTransportModel>::correctNut()
 {
-    this->nut_ = Cmu_*sqr(k_)/epsilon_;
+    bool usedGpu = false;
+
+#ifdef FOAM_USE_CUDA
+    if (useGpu_ && gpuOperational_)
+    {
+        std::string setupMessage;
+        auto& backend = getKepsilonCudaBackend();
+
+        if (!backend.prepare(gpuDeviceId_, setupMessage))
+        {
+            gpuOperational_ = false;
+            if (!setupMessage.empty())
+            {
+                WarningInFunction
+                    << "kEpsilon GPU backend initialisation failed: "
+                    << setupMessage << nl << "Falling back to CPU path." << endl;
+            }
+        }
+        else
+        {
+            scalarField& nutInternal = this->nut_.primitiveFieldRef();
+            const scalarField& kInternal = k_.primitiveField();
+            const scalarField& epsilonInternal = epsilon_.primitiveField();
+
+            if
+            (
+                nutInternal.size() == kInternal.size()
+             && nutInternal.size() == epsilonInternal.size()
+             && nutInternal.size() == this->mesh_.nCells()
+            )
+            {
+                usedGpu = backend.launchCorrectNut
+                (
+                    nutInternal.begin(),
+                    kInternal.begin(),
+                    epsilonInternal.begin(),
+                    nutInternal.size(),
+                    Cmu_.value(),
+                    this->kMin_.value(),
+                    this->epsilonMin_.value()
+                );
+            }
+
+            if (!usedGpu)
+            {
+                gpuOperational_ = false;
+                WarningInFunction
+                    << "kEpsilon GPU kernel launch failed; reverting to CPU path"
+                    << endl;
+            }
+        }
+    }
+#endif
+
+    if (!usedGpu)
+    {
+        this->nut_ = Cmu_*sqr(k_)/epsilon_;
+    }
+    else
+    {
+        const scalar CmuVal = Cmu_.value();
+        const scalar kMinVal = this->kMin_.value();
+        const scalar epsMinVal = this->epsilonMin_.value();
+
+        forAll(this->nut_.boundaryField(), patchI)
+        {
+            scalarField& nutPatch = this->nut_.boundaryFieldRef()[patchI];
+            const scalarField& kPatch = k_.boundaryField()[patchI];
+            const scalarField& epsPatch = epsilon_.boundaryField()[patchI];
+
+            forAll(nutPatch, faceI)
+            {
+                const scalar kVal = Foam::max(kPatch[faceI], kMinVal);
+                const scalar epsVal = Foam::max(epsPatch[faceI], epsMinVal);
+                nutPatch[faceI] = CmuVal*kVal*kVal/epsVal;
+            }
+        }
+    }
+
     this->nut_.correctBoundaryConditions();
     fvConstraints::New(this->mesh_).constrain(this->nut_);
 }
@@ -179,10 +735,15 @@ kEpsilon<BasicMomentumTransportModel>::kEpsilon
             IOobject::AUTO_WRITE
         ),
         this->mesh_
-    )
+    ),
+    useGpu_(false),
+    gpuOperational_(false),
+    gpuDeviceId_(0)
 {
     bound(k_, this->kMin_);
     bound(epsilon_, this->epsilonMin_);
+
+    refreshGpuConfig();
 
     if (type == typeName)
     {
@@ -204,6 +765,8 @@ bool kEpsilon<BasicMomentumTransportModel>::read()
         C3_.readIfPresent(this->coeffDict());
         sigmak_.readIfPresent(this->coeffDict());
         sigmaEps_.readIfPresent(this->coeffDict());
+
+        refreshGpuConfig();
 
         return true;
     }

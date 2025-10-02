@@ -1,0 +1,70 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  10
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    object      createBafflesDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+internalFacesOnly true;
+
+baffles
+{
+    baffles1
+    {
+        type        faceZone;
+        zoneName    shell_to_solid;
+
+        owner
+        {
+            name        shell_to_solid;
+            type        mappedWall;
+            sampleMode  nearestPatchFace;
+            sampleRegion solid;
+            samplePatch solid_to_shell;
+        }
+
+        neighbour
+        {
+            name        solid_to_shell;
+            type        mappedWall;
+            sampleMode  nearestPatchFace;
+            sampleRegion shell;
+            samplePatch shell_to_solid;
+        }
+    }
+
+    baffles2
+    {
+        type        faceZone;
+        zoneName    tube_to_solid;
+
+        owner
+        {
+            name        tube_to_solid;
+            type        mappedWall;
+            sampleMode  nearestPatchFace;
+            sampleRegion solid;
+            samplePatch solid_to_tube;
+        }
+
+        neighbour
+        {
+            name        solid_to_tube;
+            type        mappedWall;
+            sampleMode  nearestPatchFace;
+            sampleRegion tube;
+            samplePatch tube_to_solid;
+        }
+    }
+}
+
+
+// ************************************************************************* //

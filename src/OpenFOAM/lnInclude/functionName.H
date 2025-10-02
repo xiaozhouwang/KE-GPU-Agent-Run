@@ -1,0 +1,1 @@
+../primitives/strings/functionName/functionName.H

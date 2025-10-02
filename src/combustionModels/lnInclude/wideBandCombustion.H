@@ -1,0 +1,1 @@
+../radiationModels/absorptionEmissionModels/wideBandCombustion/wideBandCombustion.H

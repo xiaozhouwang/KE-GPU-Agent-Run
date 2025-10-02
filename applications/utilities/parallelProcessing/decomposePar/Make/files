@@ -1,0 +1,7 @@
+decomposePar.C
+dimFieldDecomposer.C
+fvFieldDecomposer.C
+pointFieldDecomposer.C
+lagrangianFieldDecomposer.C
+
+EXE = $(FOAM_APPBIN)/decomposePar

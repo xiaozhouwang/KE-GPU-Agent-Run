@@ -1,0 +1,1 @@
+../db/dictionary/functionEntries/negEntry/negEntry.C

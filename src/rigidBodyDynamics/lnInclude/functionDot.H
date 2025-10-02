@@ -1,0 +1,1 @@
+../joints/functionDot/functionDot.H

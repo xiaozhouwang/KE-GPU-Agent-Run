@@ -1,0 +1,1 @@
+../BlendedInterfacialModel/blendingMethods/segregatedBlendingMethod/segregatedBlendingMethod.H

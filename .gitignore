@@ -1,0 +1,8 @@
+# OpenFOAM build artifacts
+platforms/
+Make/*/
+*/lnInclude/
+applications/bin/
+applications/test/
+# Logs
+log.*

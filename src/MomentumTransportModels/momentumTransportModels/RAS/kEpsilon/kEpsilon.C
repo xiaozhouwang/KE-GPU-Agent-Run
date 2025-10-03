@@ -94,6 +94,7 @@ class kEpsilonCudaBackend
     CUcontext context_;
     CUmodule module_;
     CUfunction correctNutKernel_;
+    bool usingPrimaryContext_;
 
     void cleanupLocked()
     {
@@ -105,13 +106,21 @@ class kEpsilonCudaBackend
 
         if (context_)
         {
-            cuCtxDestroy(context_);
+            if (usingPrimaryContext_)
+            {
+                cuDevicePrimaryCtxRelease(deviceId_);
+            }
+            else
+            {
+                cuCtxDestroy(context_);
+            }
             context_ = nullptr;
         }
 
         contextInitialised_ = false;
         kernelReady_ = false;
         deviceId_ = -1;
+        usingPrimaryContext_ = false;
     }
 
     bool compileKernel(const int deviceId, std::string& errorMessage)
@@ -201,7 +210,11 @@ class kEpsilonCudaBackend
             std::string log(logSize, '\0');
             if (logSize > 1)
             {
-                nvrtcGetProgramLog(prog, log.data());
+                char* logPtr = log.empty() ? nullptr : &log[0];
+                if (logPtr)
+                {
+                    nvrtcGetProgramLog(prog, logPtr);
+                }
             }
             nvrtcDestroyProgram(&prog);
 
@@ -218,7 +231,10 @@ class kEpsilonCudaBackend
         size_t ptxSize = 0;
         nvrtcGetPTXSize(prog, &ptxSize);
         std::string ptx(ptxSize, '\0');
-        nvrtcGetPTX(prog, ptx.data());
+        if (ptxSize)
+        {
+            nvrtcGetPTX(prog, &ptx[0]);
+        }
         nvrtcDestroyProgram(&prog);
 
         status = cuModuleLoadDataEx(&module_, ptx.c_str(), 0, nullptr, nullptr);
@@ -249,7 +265,8 @@ public:
         deviceId_(-1),
         context_(nullptr),
         module_(nullptr),
-        correctNutKernel_(nullptr)
+        correctNutKernel_(nullptr),
+        usingPrimaryContext_(false)
     {}
 
     ~kEpsilonCudaBackend()
@@ -306,15 +323,19 @@ public:
             return false;
         }
 
-        status = cuCtxCreate(&context_, 0, device);
+        status = cuDevicePrimaryCtxRetain(&context_, device);
         if (status != CUDA_SUCCESS)
         {
-            message = cudaErrorMessage("cuCtxCreate: ", status);
+            message = cudaErrorMessage("cuDevicePrimaryCtxRetain: ", status);
             return false;
         }
 
+        usingPrimaryContext_ = true;
+
         contextInitialised_ = true;
         deviceId_ = selectedDevice;
+
+        cuCtxSetCurrent(context_);
 
         if (!compileKernel(selectedDevice, message))
         {
@@ -448,6 +469,8 @@ inline kEpsilonCudaBackend& getKepsilonCudaBackend()
     static kEpsilonCudaBackend backend;
     return backend;
 }
+
+} // End anonymous namespace
 
 #endif
 

@@ -37,6 +37,10 @@
 - Don’t change core header names/locations without updating all dependents.
 - Don’t push experimental binaries into `/opt`. Keep experiments within this mirror.
 
+**Autonomous Execution**
+- With GPU acceleration as the target, proceed without seeking further permission; execute all necessary steps inside this mirror to progress the optimisation.
+- Continue iterating until you exhaust practical improvements, then deliver a single comprehensive report rather than intermediate status updates.
+
 
 ---
 

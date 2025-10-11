@@ -3,8 +3,10 @@
 #include "CsrExport.H"
 #include "Switch.H"
 #include "List.H"
+#include "PstreamReduceOps.H"
 
 #include <algorithm>
+#include <limits>
 
 #ifdef FOAM_USE_CUDA
 #include <cuda_runtime.h>
@@ -186,6 +188,9 @@ bool Foam::cudaPCG::gpuSolve
         return true;
     }
 
+    const bool reportStats =
+        controlDict_.lookupOrDefault<Switch>("reportGpuStats", Switch(false));
+
     cudaError_t cudaCode = cudaSetDevice(deviceId);
     if (cudaCode != cudaSuccess)
     {
@@ -198,6 +203,20 @@ bool Foam::cudaPCG::gpuSolve
     {
         message = "CSR row mismatch";
         return false;
+    }
+
+    if (reportStats)
+    {
+        const scalarField& diag = matrix_.diag();
+        scalar minDiag = std::numeric_limits<scalar>::max();
+        scalar maxDiag = -std::numeric_limits<scalar>::max();
+        for (const scalar d : diag)
+        {
+            minDiag = std::min(minDiag, d);
+            maxDiag = std::max(maxDiag, d);
+        }
+        Info<< "cudaPCG: diagonal range [" << minDiag << ", " << maxDiag << "]"
+            << nl;
     }
 
     static_assert(sizeof(scalar) == sizeof(double), "cudaPCG currently requires double precision build");
@@ -269,7 +288,6 @@ bool Foam::cudaPCG::gpuSolve
             cusparseDestroy(cusparseHandle);
             cusparseHandle = nullptr;
         }
-
         if (d_vals) cudaFree(d_vals);
         if (d_x) cudaFree(d_x);
         if (d_b) cudaFree(d_b);
@@ -356,6 +374,39 @@ bool Foam::cudaPCG::gpuSolve
     if (cusparseCreateDnVec(&vecY, rows, d_Ap, CUDA_R_64F) != CUSPARSE_STATUS_SUCCESS)
         return fail("cusparseCreateDnVec(y)");
 
+    auto applyPreconditionerVec =
+        [&](const double* rhs, double* out, const char* stage) -> bool
+    {
+        (void)stage;
+        if (cublasDcopy(cublasHandle, rows, rhs, 1, out, 1) != CUBLAS_STATUS_SUCCESS)
+        {
+            message = word("DiagCopyFail");
+            return false;
+        }
+        if
+        (
+            cublasDdgmm
+            (
+                cublasHandle,
+                CUBLAS_SIDE_LEFT,
+                rows,
+                1,
+                out,
+                rows,
+                reinterpret_cast<const double*>(d_diagInv),
+                1,
+                out,
+                rows
+            ) != CUBLAS_STATUS_SUCCESS
+        )
+        {
+            message = word("DiagScaleFail");
+            return false;
+        }
+
+        return true;
+    };
+
     const double alpha = 1.0;
     const double zero = 0.0;
     const double negOne = -1.0;
@@ -415,30 +466,37 @@ bool Foam::cudaPCG::gpuSolve
     if (cublasDaxpy(cublasHandle, rows, reinterpret_cast<const double*>(&negOne), reinterpret_cast<const double*>(d_Ap), 1, reinterpret_cast<double*>(d_r), 1) != CUBLAS_STATUS_SUCCESS)
         return fail("cublas axpy r -= Ap");
 
-    if (cublasDdgmm(cublasHandle, CUBLAS_SIDE_LEFT, rows, 1, reinterpret_cast<const double*>(d_r), rows, reinterpret_cast<const double*>(d_diagInv), 1, reinterpret_cast<double*>(d_z), rows) != CUBLAS_STATUS_SUCCESS)
-        return fail("cublas dgmm diagInv*r");
+    if (!applyPreconditionerVec(reinterpret_cast<const double*>(d_r), reinterpret_cast<double*>(d_z), "initial"))
+        return fail(message);
 
     if (cublasDcopy(cublasHandle, rows, reinterpret_cast<const double*>(d_z), 1, reinterpret_cast<double*>(d_p), 1) != CUBLAS_STATUS_SUCCESS)
         return fail("cublas copy z->p");
 
-    scalarField rHost(nCells, Zero);
-    scalarField zHost(nCells, Zero);
-    scalarField pHost(nCells, Zero);
     scalarField wA(nCells, Zero);
     scalarField pA(nCells, Zero);
 
-    cudaMemcpy(rHost.begin(), d_r, sizeof(DeviceScalar)*rows, cudaMemcpyDeviceToHost);
-    cudaMemcpy(zHost.begin(), d_z, sizeof(DeviceScalar)*rows, cudaMemcpyDeviceToHost);
     cudaMemcpy(wA.begin(), d_Ap, sizeof(DeviceScalar)*rows, cudaMemcpyDeviceToHost);
-    cudaMemcpy(pHost.begin(), d_p, sizeof(DeviceScalar)*rows, cudaMemcpyDeviceToHost);
+    cudaMemcpy(pA.begin(), d_p, sizeof(DeviceScalar)*rows, cudaMemcpyDeviceToHost);
 
-    scalar rz = gSumProd(rHost, zHost, matrix_.mesh().comm());
+    double rzDevice = 0.0;
+    if (cublasDdot(cublasHandle, rows, reinterpret_cast<const double*>(d_r), 1, reinterpret_cast<const double*>(d_z), 1, &rzDevice) != CUBLAS_STATUS_SUCCESS)
+    {
+        cleanup();
+        return fail("cublas dot(r,z)");
+    }
+    scalar rz = returnReduce(static_cast<scalar>(rzDevice), sumOp<scalar>());
 
     scalar normFactor = this->normFactor(psi, source, wA, pA);
 
-    solverPerf.initialResidual() =
-        gSumMag(rHost, matrix_.mesh().comm())
-       /normFactor;
+    double sumAbsDevice = 0.0;
+    if (cublasDasum(cublasHandle, rows, reinterpret_cast<const double*>(d_r), 1, &sumAbsDevice) != CUBLAS_STATUS_SUCCESS)
+    {
+        cleanup();
+        return fail("cublas dasum(r)");
+    }
+    scalar sumAbs = returnReduce(static_cast<scalar>(sumAbsDevice), sumOp<scalar>());
+
+    solverPerf.initialResidual() = sumAbs/normFactor;
     solverPerf.finalResidual() = solverPerf.initialResidual();
 
     if
@@ -489,10 +547,13 @@ bool Foam::cudaPCG::gpuSolve
         cusparseDnVecSetValues(vecX, d_x);
         cusparseDnVecSetValues(vecY, d_Ap);
 
-        cudaMemcpy(wA.begin(), d_Ap, sizeof(DeviceScalar)*rows, cudaMemcpyDeviceToHost);
-        cudaMemcpy(pHost.begin(), d_p, sizeof(DeviceScalar)*rows, cudaMemcpyDeviceToHost);
-
-        scalar pAp = gSumProd(wA, pHost, matrix_.mesh().comm());
+        double pApDevice = 0.0;
+        if (cublasDdot(cublasHandle, rows, reinterpret_cast<const double*>(d_p), 1, reinterpret_cast<const double*>(d_Ap), 1, &pApDevice) != CUBLAS_STATUS_SUCCESS)
+        {
+            cleanup();
+            return fail("cublas dot(p,Ap)");
+        }
+        scalar pAp = returnReduce(static_cast<scalar>(pApDevice), sumOp<scalar>());
 
         if (solverPerf.checkSingularity(mag(pAp)/normFactor))
         {
@@ -508,11 +569,14 @@ bool Foam::cudaPCG::gpuSolve
         if (cublasDaxpy(cublasHandle, rows, &negAlphaDevice, reinterpret_cast<const double*>(d_Ap), 1, reinterpret_cast<double*>(d_r), 1) != CUBLAS_STATUS_SUCCESS)
             return fail("cublas axpy r -= alpha*Ap");
 
-        cudaMemcpy(rHost.begin(), d_r, sizeof(DeviceScalar)*rows, cudaMemcpyDeviceToHost);
+        if (cublasDasum(cublasHandle, rows, reinterpret_cast<const double*>(d_r), 1, &sumAbsDevice) != CUBLAS_STATUS_SUCCESS)
+        {
+            cleanup();
+            return fail("cublas dasum(r iter)");
+        }
+        sumAbs = returnReduce(static_cast<scalar>(sumAbsDevice), sumOp<scalar>());
 
-        solverPerf.finalResidual() =
-            gSumMag(rHost, matrix_.mesh().comm())
-           /normFactor;
+        solverPerf.finalResidual() = sumAbs/normFactor;
 
         ++iter;
         solverPerf.nIterations() = iter;
@@ -526,13 +590,18 @@ bool Foam::cudaPCG::gpuSolve
             break;
         }
 
-        if (cublasDdgmm(cublasHandle, CUBLAS_SIDE_LEFT, rows, 1, reinterpret_cast<const double*>(d_r), rows, reinterpret_cast<const double*>(d_diagInv), 1, reinterpret_cast<double*>(d_z), rows) != CUBLAS_STATUS_SUCCESS)
-            return fail("cublas dgmm diagInv*r (iter)");
+        if (!applyPreconditionerVec(reinterpret_cast<const double*>(d_r), reinterpret_cast<double*>(d_z), "iter"))
+            return fail(message);
 
-        cudaMemcpy(zHost.begin(), d_z, sizeof(DeviceScalar)*rows, cudaMemcpyDeviceToHost);
+        double rzNewDevice = 0.0;
+        if (cublasDdot(cublasHandle, rows, reinterpret_cast<const double*>(d_r), 1, reinterpret_cast<const double*>(d_z), 1, &rzNewDevice) != CUBLAS_STATUS_SUCCESS)
+        {
+            cleanup();
+            return fail("cublas dot(r,z) iter");
+        }
 
         const scalar rzOld = rz;
-        rz = gSumProd(rHost, zHost, matrix_.mesh().comm());
+        rz = returnReduce(static_cast<scalar>(rzNewDevice), sumOp<scalar>());
 
         const scalar betaStep = rzOld != 0 ? rz/rzOld : 0;
         const double betaDevice = static_cast<double>(betaStep);

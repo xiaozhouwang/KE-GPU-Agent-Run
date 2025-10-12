@@ -41,6 +41,13 @@
 - With GPU acceleration as the target, proceed without seeking further permission; execute all necessary steps inside this mirror to progress the optimisation.
 - Continue iterating until you exhaust practical improvements, then deliver a single comprehensive report rather than intermediate status updates.
 
+**End-to-End GPU Goal (Phase 2+)**
+- Do not modify or regress the CPU implementation. Treat `/opt/openfoam10` and branch `main` as the stable CPU baseline; use runtime selection/feature flags for all GPU work.
+- Target: implement the entire PIMPLE loop on the GPU (assembly, turbulence updates, reductions, linear solves) and beat the CPU wall-clock (≈35 s on pitzDaily) on the same case and hardware while preserving parity (relative L2(Ux) ≤ 1e-2 at final time).
+- Prioritise changes that reduce end-to-end GPU time over negligible micro-optimisations.
+- Operate autonomously for this goal: you do not need additional approval to build, run, and iterate within this mirror. Keep CPU behaviour identical unless GPU is explicitly selected.
+- Safety rails: if a GPU trial exceeds 10 minutes, diverges, or fails the parity gate, revert to the safe path (diagonal preconditioner, CPU fallback) and iterate.
+
 
 ---
 

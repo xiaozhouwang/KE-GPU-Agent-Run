@@ -48,6 +48,20 @@
 - Operate autonomously for this goal: you do not need additional approval to build, run, and iterate within this mirror. Keep CPU behaviour identical unless GPU is explicitly selected.
 - Safety rails: if a GPU trial exceeds 10 minutes, diverges, or fails the parity gate, revert to the safe path (diagonal preconditioner, CPU fallback) and iterate.
 
+**PLAN (current execution order)**
+1. Add a coloured GPU preconditioner:
+   - Build colour sets from the pressure matrix addressing and launch per-colour forward/back sweeps with damping.
+   - Auto-fallback to the diagonal preconditioner if divergence or instability is detected.
+2. Reduce CG iteration overhead:
+   - Implement a pipelined CG variant that fuses dot products/reductions.
+   - Capture the steady-state kernel sequence in a CUDA Graph to trim launch latency (retain the legacy path as a runtime switch).
+3. Keep the full PIMPLE loop on the GPU:
+   - Extend `pimpleFoamGPU` so ddt/div/laplacian kernels, turbulence `correct()`, and Courant calculations operate on device-resident fields.
+   - Copy results back only at write times; CPU path remains untouched.
+4. Validate on the standard pitzDaily case:
+   - Confirm parity (relative L2(Ux) ≤ 1e-2) and measure wall-clock vs the 35 s CPU baseline.
+   - Iterate until the GPU path beats the CPU timing or no further practical improvements are found.
+
 
 ---
 

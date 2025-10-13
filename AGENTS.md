@@ -53,16 +53,14 @@
    - **Status:** pitzDaily sweep complete (`run/logs/pitzDaily_gpu_colour_scan2_20251012-150314/summary.csv`). All runs stayed on the colour path (`disableCount=0`).
    - Recommended defaults baked into `cudaPCG`: `colourOmega=0.65`, `colourBackwardOmega=0.85`, `colourDiagFloor=1e-12` (details in `docs/gpu-colour-preconditioner-20251012.md`).
    - Telemetry/logging (`logResidualTrajectory`, `logColourStats`) and sweep script (`bin/gpu_colour_sweep.sh`) ready for future validation cases.
-2. Reduce CG iteration overhead:
-   - **Status:** pipelined search-direction update (`usePipelinedCG`) landed; steady-state `cusparseSpMV` replay captured via CUDA Graph when `useCudaGraph` is true (`cudaGraphWarmup` configurable). Iteration timing available via `logIterationStats`.
-   - Pipelined smoke log: `run/logs/pitzDaily_gpu_colour_pipelined_smoke_20251012-183303/summary.csv` (rel L2(Ux)≈3.3e-5, ExecutionTime ≈245 s).
-   - New grid sweep (ω_fwd∈[0.50..0.65], ω_back∈[0.70..0.85]) under `run/logs/pitzDaily_gpu_colour_grid_small_*` shows ω_fwd≈0.65, ω_back≈0.80 drops PCG iterations to ≈77 while keeping rel L2≈3.2e-5 (ExecTime ≈231 s). Further tuning required to regain the ~116 s baseline.
-3. Keep the full PIMPLE loop on the GPU:
-   - Extend `pimpleFoamGPU` so ddt/div/laplacian kernels, turbulence `correct()`, and Courant calculations operate on device-resident fields.
-   - Copy results back only at write times; CPU path remains untouched.
-4. Validate on the standard pitzDaily case:
-   - Confirm parity (relative L2(Ux) ≤ 1e-2) and measure wall-clock vs the 35 s CPU baseline.
-   - Iterate until the GPU path beats the CPU timing or no further practical improvements are found.
+2. Reduce CG iteration overhead (infrastructure ready):
+   - Pipelined direction update (`usePipelinedCG`), CUDA Graph replay (`useCudaGraph`), and iteration timing (`logIterationStats`) are available. Grid sweep (`run/logs/pitzDaily_gpu_colour_grid_small_*`) indicates ω_fwd≈0.65, ω_back≈0.80 is a good compromise (~77 iterations, rel L2≈3.2e-5, ExecutionTime ≈231 s). Further heuristics deferred until the full GPU loop is in place.
+3. Full GPU PIMPLE loop (next focus):
+   - Keep volume fields resident on device; port ddt/div/laplacian kernels, turbulence `correct()`, and Courant/time-step logic into CUDA.
+   - Only copy data back at write times; CPU path remains untouched when GPU is disabled.
+4. End-to-end validation & regression guards:
+   - Extend sweep scripts to capture wall-clock and enforce parity/iteration/time thresholds (via `bin/check_colour_summary.py`).
+   - Benchmark pitzDaily (and a secondary case) to drive the GPU loop below the 35 s CPU baseline while keeping relative L2(Ux) ≤ 1e-2.
 
 
 ---

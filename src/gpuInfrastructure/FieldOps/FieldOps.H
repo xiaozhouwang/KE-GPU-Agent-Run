@@ -39,6 +39,20 @@ bool velocityCorrector
     OperationStats* stats = nullptr
 );
 
+//- Compute nut = Cmu * max(k,kMin)^2 / max(epsilon, epsilonMin) on device.
+bool computeNutFromKEpsilon
+(
+    Context& ctx,
+    DeviceField<volScalarField>& nut,
+    const DeviceField<volScalarField>& k,
+    const DeviceField<volScalarField>& epsilon,
+    const scalar Cmu,
+    const scalar kMin,
+    const scalar epsilonMin,
+    word& error,
+    OperationStats* stats = nullptr
+);
+
 } // namespace gpu
 } // namespace Foam
 

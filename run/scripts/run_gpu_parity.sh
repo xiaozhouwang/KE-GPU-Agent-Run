@@ -33,6 +33,35 @@ foamDictionary -entry application -set pimpleFoamGPU "${GPU_CASE}/system/control
 foamDictionary -entry "PIMPLE.useGpuFieldOps" -set false "${CPU_CASE}/system/fvSolution" >/dev/null
 foamDictionary -entry "PIMPLE.useGpuFieldOps" -set true "${GPU_CASE}/system/fvSolution" >/dev/null
 
+set_turbulence_gpu_flag()
+{
+    local caseDir=$1
+    local value=$2
+    local dictPath="${caseDir}/constant/RASProperties"
+    if [[ -f "${dictPath}" ]]; then
+        for entry in \
+            "RASModelCoeffs.useGPU" \
+            "kEpsilonCoeffs.useGPU" \
+            "coeffs.useGPU"
+        do
+            foamDictionary -entry "${entry}" -set "${value}" "${dictPath}" >/dev/null 2>&1 || true
+        done
+    fi
+
+    dictPath="${caseDir}/constant/momentumTransport"
+    if [[ -f "${dictPath}" ]]; then
+        for entry in \
+            "RAS.coeffs.useGPU" \
+            "RAS.kEpsilonCoeffs.useGPU"
+        do
+            foamDictionary -entry "${entry}" -set "${value}" "${dictPath}" >/dev/null 2>&1 || true
+        done
+    fi
+}
+
+set_turbulence_gpu_flag "${CPU_CASE}" false
+set_turbulence_gpu_flag "${GPU_CASE}" true
+
 run_case() {
     local caseDir=$1
     (

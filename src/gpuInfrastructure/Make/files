@@ -1,5 +1,6 @@
 GpuContext/GpuContext.C
 DeviceField/DeviceField.C
 FieldOps/FieldOps.C
+FvOperators/FvOperators.C
 
 LIB = $(FOAM_USER_LIBBIN)/libgpuInfrastructure

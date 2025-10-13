@@ -29,6 +29,7 @@ Description
 #include "DeviceField.H"
 #include "GpuContext.H"
 #include "FieldOps.H"
+#include "FvOperators.H"
 #include "DynamicList.H"
 #include "OFstream.H"
 #include "OSspecific.H"
@@ -173,7 +174,7 @@ int main(int argc, char *argv[])
 
             fvModels.correct();
 
-            #include "UEqn.H"
+            #include "UEqnGPU.H"
 
             while (pimple.correct())
             {

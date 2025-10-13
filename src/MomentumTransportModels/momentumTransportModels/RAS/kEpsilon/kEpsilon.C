@@ -28,18 +28,14 @@ License
 #include "fvConstraints.H"
 #include "bound.H"
 #include "Switch.H"
+#include "GpuContext.H"
+#include "DeviceField.H"
+#include "FieldOps.H"
 
 #include <algorithm>
 #include <cctype>
 #include <sstream>
 #include <string>
-
-#ifdef FOAM_USE_CUDA
-#include <cuda.h>
-#include <nvrtc.h>
-#include <mutex>
-#include <vector>
-#endif
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -48,436 +44,11 @@ namespace Foam
 namespace RASModels
 {
 
-#ifdef FOAM_USE_CUDA
-namespace
-{
-
-inline std::string cudaErrorMessage(const char* prefix, const CUresult code)
-{
-    const char* msg = nullptr;
-    cuGetErrorString(code, &msg);
-
-    std::ostringstream os;
-    os << prefix;
-    if (msg)
-    {
-        os << msg;
-    }
-    else
-    {
-        os << "unknown CUDA error";
-    }
-    os << " (" << static_cast<int>(code) << ')';
-    return os.str();
-}
-
-
-inline std::string nvrtcErrorMessage
-(
-    const char* prefix,
-    const nvrtcResult code
-)
-{
-    std::ostringstream os;
-    os << prefix << nvrtcGetErrorString(code) << " (" << static_cast<int>(code)
-       << ')';
-    return os.str();
-}
-
-
-class kEpsilonCudaBackend
-{
-    std::mutex mutex_;
-    bool contextInitialised_;
-    bool kernelReady_;
-    int deviceId_;
-    CUcontext context_;
-    CUmodule module_;
-    CUfunction correctNutKernel_;
-    bool usingPrimaryContext_;
-
-    void cleanupLocked()
-    {
-        if (module_)
-        {
-            cuModuleUnload(module_);
-            module_ = nullptr;
-        }
-
-        if (context_)
-        {
-            if (usingPrimaryContext_)
-            {
-                cuDevicePrimaryCtxRelease(deviceId_);
-            }
-            else
-            {
-                cuCtxDestroy(context_);
-            }
-            context_ = nullptr;
-        }
-
-        contextInitialised_ = false;
-        kernelReady_ = false;
-        deviceId_ = -1;
-        usingPrimaryContext_ = false;
-    }
-
-    bool compileKernel(const int deviceId, std::string& errorMessage)
-    {
-        CUdevice device;
-        CUresult status = cuDeviceGet(&device, deviceId);
-
-        if (status != CUDA_SUCCESS)
-        {
-            errorMessage = cudaErrorMessage("cuDeviceGet: ", status);
-            return false;
-        }
-
-        int major = 0;
-        int minor = 0;
-        status = cuDeviceComputeCapability(&major, &minor, device);
-
-        if (status != CUDA_SUCCESS)
-        {
-            errorMessage = cudaErrorMessage("cuDeviceComputeCapability: ", status);
-            return false;
-        }
-
-        std::ostringstream arch;
-        arch << "--gpu-architecture=compute_" << major << minor;
-
-        const std::string scalarName =
-            sizeof(scalar) == sizeof(float) ? "float" : "double";
-
-        std::ostringstream source;
-        source
-            << "extern \"C\" __global__ void correctNutKernel("
-            << scalarName << "* __restrict__ nut,"
-            << " const " << scalarName << "* __restrict__ k,"
-            << " const " << scalarName << "* __restrict__ epsilon,"
-            << ' ' << scalarName << " Cmu,"
-            << ' ' << scalarName << " kMin,"
-            << ' ' << scalarName << " epsilonMin,"
-            << " int n)\n"
-            << "{\n"
-            << "    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
-            << "    if (idx < n)\n    {\n"
-            << "        " << scalarName << " kval = k[idx];\n"
-            << "        if (kval < kMin) kval = kMin;\n"
-            << "        " << scalarName << " eps = epsilon[idx];\n"
-            << "        if (eps < epsilonMin) eps = epsilonMin;\n"
-            << "        " << scalarName << " value = Cmu * kval * kval / eps;\n"
-            << "        nut[idx] = value;\n"
-            << "    }\n"
-            << "}\n";
-
-        nvrtcProgram prog;
-        nvrtcResult nvStatus = nvrtcCreateProgram
-        (
-            &prog,
-            source.str().c_str(),
-            "kEpsilonCorrectNut.cu",
-            0,
-            nullptr,
-            nullptr
-        );
-
-        if (nvStatus != NVRTC_SUCCESS)
-        {
-            errorMessage = nvrtcErrorMessage("nvrtcCreateProgram: ", nvStatus);
-            return false;
-        }
-
-        std::vector<std::string> optionStorage;
-        optionStorage.emplace_back("--std=c++14");
-        optionStorage.emplace_back("--fmad=false");
-        optionStorage.emplace_back(arch.str());
-
-        std::vector<const char*> options;
-        options.reserve(optionStorage.size());
-        for (const std::string& opt : optionStorage)
-        {
-            options.push_back(opt.c_str());
-        }
-
-        nvStatus = nvrtcCompileProgram(prog, options.size(), options.data());
-
-        if (nvStatus != NVRTC_SUCCESS)
-        {
-            size_t logSize = 0;
-            nvrtcGetProgramLogSize(prog, &logSize);
-            std::string log(logSize, '\0');
-            if (logSize > 1)
-            {
-                char* logPtr = log.empty() ? nullptr : &log[0];
-                if (logPtr)
-                {
-                    nvrtcGetProgramLog(prog, logPtr);
-                }
-            }
-            nvrtcDestroyProgram(&prog);
-
-            std::ostringstream os;
-            os << "nvrtcCompileProgram: " << nvrtcGetErrorString(nvStatus);
-            if (!log.empty())
-            {
-                os << '\n' << log;
-            }
-            errorMessage = os.str();
-            return false;
-        }
-
-        size_t ptxSize = 0;
-        nvrtcGetPTXSize(prog, &ptxSize);
-        std::string ptx(ptxSize, '\0');
-        if (ptxSize)
-        {
-            nvrtcGetPTX(prog, &ptx[0]);
-        }
-        nvrtcDestroyProgram(&prog);
-
-        status = cuModuleLoadDataEx(&module_, ptx.c_str(), 0, nullptr, nullptr);
-        if (status != CUDA_SUCCESS)
-        {
-            errorMessage = cudaErrorMessage("cuModuleLoadDataEx: ", status);
-            return false;
-        }
-
-        status = cuModuleGetFunction(&correctNutKernel_, module_, "correctNutKernel");
-        if (status != CUDA_SUCCESS)
-        {
-            errorMessage = cudaErrorMessage("cuModuleGetFunction: ", status);
-            return false;
-        }
-
-        kernelReady_ = true;
-        return true;
-    }
-
-public:
-
-    kEpsilonCudaBackend()
-    :
-        mutex_(),
-        contextInitialised_(false),
-        kernelReady_(false),
-        deviceId_(-1),
-        context_(nullptr),
-        module_(nullptr),
-        correctNutKernel_(nullptr),
-        usingPrimaryContext_(false)
-    {}
-
-    ~kEpsilonCudaBackend()
-    {
-        std::lock_guard<std::mutex> guard(mutex_);
-        cleanupLocked();
-    }
-
-    bool prepare(const int requestedDeviceId, std::string& message)
-    {
-        std::lock_guard<std::mutex> guard(mutex_);
-        message.clear();
-
-        if (kernelReady_ && contextInitialised_ && requestedDeviceId == deviceId_)
-        {
-            cuCtxSetCurrent(context_);
-            return true;
-        }
-
-        cleanupLocked();
-
-        CUresult status = cuInit(0);
-        if (status != CUDA_SUCCESS)
-        {
-            message = cudaErrorMessage("cuInit: ", status);
-            return false;
-        }
-
-        int deviceCount = 0;
-        status = cuDeviceGetCount(&deviceCount);
-        if (status != CUDA_SUCCESS)
-        {
-            message = cudaErrorMessage("cuDeviceGetCount: ", status);
-            return false;
-        }
-
-        if (deviceCount <= 0)
-        {
-            message = "No CUDA devices detected";
-            return false;
-        }
-
-        int selectedDevice = requestedDeviceId;
-        if (selectedDevice < 0 || selectedDevice >= deviceCount)
-        {
-            selectedDevice = ((selectedDevice % deviceCount) + deviceCount) % deviceCount;
-        }
-
-        CUdevice device;
-        status = cuDeviceGet(&device, selectedDevice);
-        if (status != CUDA_SUCCESS)
-        {
-            message = cudaErrorMessage("cuDeviceGet: ", status);
-            return false;
-        }
-
-        status = cuDevicePrimaryCtxRetain(&context_, device);
-        if (status != CUDA_SUCCESS)
-        {
-            message = cudaErrorMessage("cuDevicePrimaryCtxRetain: ", status);
-            return false;
-        }
-
-        usingPrimaryContext_ = true;
-
-        contextInitialised_ = true;
-        deviceId_ = selectedDevice;
-
-        cuCtxSetCurrent(context_);
-
-        if (!compileKernel(selectedDevice, message))
-        {
-            cleanupLocked();
-            return false;
-        }
-
-        return kernelReady_;
-    }
-
-    bool launchCorrectNut
-    (
-        scalar* nut,
-        const scalar* k,
-        const scalar* epsilon,
-        const label nCells,
-        const scalar Cmu,
-        const scalar kMin,
-        const scalar epsilonMin
-    )
-    {
-        std::lock_guard<std::mutex> guard(mutex_);
-
-        if (!kernelReady_ || !contextInitialised_)
-        {
-            return false;
-        }
-
-        cuCtxSetCurrent(context_);
-
-        const size_t bytes = nCells*sizeof(scalar);
-
-        CUdeviceptr dNut = 0;
-        CUdeviceptr dK = 0;
-        CUdeviceptr dEps = 0;
-
-        CUresult status = cuMemAlloc(&dNut, bytes);
-        if (status != CUDA_SUCCESS)
-        {
-            return false;
-        }
-
-        status = cuMemAlloc(&dK, bytes);
-        if (status != CUDA_SUCCESS)
-        {
-            cuMemFree(dNut);
-            return false;
-        }
-
-        status = cuMemAlloc(&dEps, bytes);
-        if (status != CUDA_SUCCESS)
-        {
-            cuMemFree(dNut);
-            cuMemFree(dK);
-            return false;
-        }
-
-        bool ok = true;
-
-        status = cuMemcpyHtoD(dK, k, bytes);
-        ok = ok && status == CUDA_SUCCESS;
-        status = cuMemcpyHtoD(dEps, epsilon, bytes);
-        ok = ok && status == CUDA_SUCCESS;
-
-        if (!ok)
-        {
-            cuMemFree(dNut);
-            cuMemFree(dK);
-            cuMemFree(dEps);
-            return false;
-        }
-
-        const int threadsPerBlock = 256;
-        const int blocks = static_cast<int>
-        (
-            (nCells + threadsPerBlock - 1)/threadsPerBlock
-        );
-
-        int nCellsInt = static_cast<int>(nCells);
-        scalar kernelCmu = Cmu;
-        scalar kernelKmin = kMin;
-        scalar kernelEpsilonMin = epsilonMin;
-
-        void* args[] =
-        {
-            &dNut,
-            &dK,
-            &dEps,
-            &kernelCmu,
-            &kernelKmin,
-            &kernelEpsilonMin,
-            &nCellsInt
-        };
-
-        status = cuLaunchKernel
-        (
-            correctNutKernel_,
-            blocks, 1, 1,
-            threadsPerBlock, 1, 1,
-            0,
-            nullptr,
-            args,
-            nullptr
-        );
-
-        ok = ok && status == CUDA_SUCCESS;
-
-        if (ok)
-        {
-            status = cuCtxSynchronize();
-            ok = ok && status == CUDA_SUCCESS;
-        }
-
-        if (ok)
-        {
-            status = cuMemcpyDtoH(nut, dNut, bytes);
-            ok = ok && status == CUDA_SUCCESS;
-        }
-
-        cuMemFree(dNut);
-        cuMemFree(dK);
-        cuMemFree(dEps);
-
-        return ok;
-    }
-};
-
-
-inline kEpsilonCudaBackend& getKepsilonCudaBackend()
-{
-    static kEpsilonCudaBackend backend;
-    return backend;
-}
-
-} // End anonymous namespace
-
-#endif
 
 template<class BasicMomentumTransportModel>
 void kEpsilon<BasicMomentumTransportModel>::refreshGpuConfig()
 {
-    bool requestedGpu = false;
+    bool requestedGpu = true;
 
     Switch gpuSwitch(false);
     if (gpuSwitch.readIfPresent("useGPU", this->coeffDict_))
@@ -519,19 +90,21 @@ void kEpsilon<BasicMomentumTransportModel>::refreshGpuConfig()
 
     useGpu_ = requestedGpu;
 
-    gpuDeviceId_ = this->coeffDict_.template lookupOrDefault<label>("gpuDevice", gpuDeviceId_);
-    gpuDeviceId_ = this->coeffDict_.template lookupOrDefault<label>("deviceId", gpuDeviceId_);
-
-    gpuOperational_ = useGpu_;
-
-#ifndef FOAM_USE_CUDA
+#ifdef FOAM_USE_CUDA
+    if (useGpu_ && !Foam::gpu::available())
+    {
+        WarningInFunction
+            << "kEpsilon GPU backend requested but CUDA context is unavailable"
+            << nl << "Continuing with CPU implementation." << endl;
+        useGpu_ = false;
+    }
+#else
     if (useGpu_)
     {
         WarningInFunction
-            << "kEpsilon GPU backend requested but this build lacks CUDA support" << nl
-            << "Continuing with CPU implementation." << endl;
+            << "kEpsilon GPU backend requested but this build lacks CUDA support"
+            << nl << "Continuing with CPU implementation." << endl;
         useGpu_ = false;
-        gpuOperational_ = false;
     }
 #endif
 }
@@ -543,57 +116,48 @@ void kEpsilon<BasicMomentumTransportModel>::correctNut()
 {
     bool usedGpu = false;
 
-#ifdef FOAM_USE_CUDA
-    if (useGpu_ && gpuOperational_)
+    if (useGpu_)
     {
-        std::string setupMessage;
-        auto& backend = getKepsilonCudaBackend();
-
-        if (!backend.prepare(gpuDeviceId_, setupMessage))
+        Foam::gpu::Context& ctx = Foam::gpu::globalContext();
+        if (ctx.ready())
         {
-            gpuOperational_ = false;
-            if (!setupMessage.empty())
-            {
-                WarningInFunction
-                    << "kEpsilon GPU backend initialisation failed: "
-                    << setupMessage << nl << "Falling back to CPU path." << endl;
-            }
-        }
-        else
-        {
-            scalarField& nutInternal = this->nut_.primitiveFieldRef();
-            const scalarField& kInternal = k_.primitiveField();
-            const scalarField& epsilonInternal = epsilon_.primitiveField();
+            Foam::gpu::FieldRegistry& registry =
+                Foam::gpu::FieldRegistry::New(this->mesh_);
 
+            Foam::gpu::DeviceField<volScalarField>& nutDev =
+                registry.getOrCreate(this->nut_);
+            Foam::gpu::DeviceField<volScalarField>& kDev =
+                registry.getOrCreate(k_);
+            Foam::gpu::DeviceField<volScalarField>& epsilonDev =
+                registry.getOrCreate(epsilon_);
+
+            word gpuError;
             if
             (
-                nutInternal.size() == kInternal.size()
-             && nutInternal.size() == epsilonInternal.size()
-             && nutInternal.size() == this->mesh_.nCells()
-            )
-            {
-                usedGpu = backend.launchCorrectNut
+                Foam::gpu::computeNutFromKEpsilon
                 (
-                    nutInternal.begin(),
-                    kInternal.begin(),
-                    epsilonInternal.begin(),
-                    nutInternal.size(),
+                    ctx,
+                    nutDev,
+                    kDev,
+                    epsilonDev,
                     Cmu_.value(),
                     this->kMin_.value(),
-                    this->epsilonMin_.value()
-                );
-            }
-
-            if (!usedGpu)
+                    this->epsilonMin_.value(),
+                    gpuError,
+                    nullptr
+                )
+            )
             {
-                gpuOperational_ = false;
+                usedGpu = true;
+            }
+            else if (!gpuError.empty())
+            {
                 WarningInFunction
-                    << "kEpsilon GPU kernel launch failed; reverting to CPU path"
-                    << endl;
+                    << "kEpsilon GPU nut update failed: "
+                    << gpuError << nl << "Falling back to CPU path." << endl;
             }
         }
     }
-#endif
 
     if (!usedGpu)
     {
@@ -622,6 +186,40 @@ void kEpsilon<BasicMomentumTransportModel>::correctNut()
 
     this->nut_.correctBoundaryConditions();
     fvConstraints::New(this->mesh_).constrain(this->nut_);
+
+    if (useGpu_)
+    {
+        Foam::gpu::Context& ctx = Foam::gpu::globalContext();
+        if (ctx.ready())
+        {
+            Foam::gpu::FieldRegistry& registry =
+                Foam::gpu::FieldRegistry::New(this->mesh_);
+
+            word syncError;
+            Foam::gpu::DeviceField<volScalarField>& nutDev =
+                registry.getOrCreate(this->nut_);
+            Foam::gpu::DeviceField<volScalarField>& kDev =
+                registry.getOrCreate(k_);
+            Foam::gpu::DeviceField<volScalarField>& epsDev =
+                registry.getOrCreate(epsilon_);
+
+            nutDev.markHostDirty();
+            kDev.markHostDirty();
+            epsDev.markHostDirty();
+
+            if
+            (
+                !nutDev.syncHostToDevice(ctx, syncError)
+             || !kDev.syncHostToDevice(ctx, syncError)
+             || !epsDev.syncHostToDevice(ctx, syncError)
+            )
+            {
+                WarningInFunction
+                    << "Failed to synchronise turbulence fields to GPU: "
+                    << syncError << endl;
+            }
+        }
+    }
 }
 
 
@@ -759,9 +357,7 @@ kEpsilon<BasicMomentumTransportModel>::kEpsilon
         ),
         this->mesh_
     ),
-    useGpu_(false),
-    gpuOperational_(false),
-    gpuDeviceId_(0)
+    useGpu_(false)
 {
     bound(k_, this->kMin_);
     bound(epsilon_, this->epsilonMin_);

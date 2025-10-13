@@ -38,9 +38,58 @@ constrainPressure(p, U, phiHbyA, rAtUField, MRF);
 // Non-orthogonal pressure corrector loop
 while (pimple.correctNonOrthogonal())
 {
+    bool usedGpuLap = false;
+    Foam::gpu::OperationStats lapStats;
+    word gpuLapError;
+    tmp<fvScalarMatrix> tGpuLap;
+
+    if (useGpuFieldOps && gpuContext.ready())
+    {
+        tGpuLap = Foam::gpu::fvm::laplacian
+        (
+            gpuContext,
+            gpuRegistry,
+            rAtUField,
+            p,
+            usedGpuLap,
+            gpuLapError,
+            logGpuFieldOps ? &lapStats : nullptr
+        );
+
+        if (!usedGpuLap && !gpuLapError.empty())
+        {
+            WarningInFunction
+                << "GPU fvm::laplacian() fallback: "
+                << gpuLapError << nl << endl;
+        }
+    }
+
+    tmp<fvScalarMatrix> tLap;
+    if (usedGpuLap)
+    {
+        if (logGpuFieldOps)
+        {
+            gpuOpStats.append
+            (
+                {
+                    runTime.timeName(),
+                    word("fvmLaplacian"),
+                    lapStats.gpuMilliseconds
+                }
+            );
+        }
+
+        tLap = std::move(tGpuLap);
+    }
+    else
+    {
+        tLap = fvm::laplacian(rAtUField, p);
+    }
+
     fvScalarMatrix pEqn
     (
-        fvm::laplacian(rAtUField, p) == fvc::div(phiHbyA)
+        tLap
+     == fvc::div(phiHbyA)
     );
 
     pEqn.setReference

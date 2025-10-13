@@ -49,19 +49,28 @@
 - Safety rails: if a GPU trial exceeds 10 minutes, diverges, or fails the parity gate, revert to the safe path (diagonal preconditioner, CPU fallback) and iterate.
 
 **PLAN (current execution order)**
-1. **GPU finite-volume operators**
-   - Port `fvm::ddt`, `fvm::div(phi,U)`, and `fvm::laplacian(rAtU(),p)` to dedicated CUDA kernels that operate on the existing device-resident field wrappers.
-   - Mirror boundary-condition handling from the CPU path; ensure the kernels accept runtime-selected discretisation schemes.
-   - Integrate the kernels into `pimpleFoamGPU`, keeping the CPU implementation intact behind `useGpuFieldOps=false`.
-2. **Turbulence and source-term GPU path**
-   - Implement a CUDA-backed turbulence `correct()` (RAS initially) and any dependent algebra so turbulence fields remain on-device.
-   - Audit additional source terms (fvModels/fvConstraints) and provide GPU fallbacks or staged host/device copies as needed.
-3. **Kernel orchestration & caching**
-   - Extend the GPU infrastructure to cache NVRTC output per compute capability, batch small vector ops via CUDA Graphs, and introduce multi-stream execution where overlap with host IO is possible.
-   - Add SoA-friendly accessors or layouts for vector fields if profiling shows strided loads as a bottleneck.
+1. **GPU finite-volume operators** *(completed)*
+   - Device variants for `fvm::ddt`, `fvm::div(phi,U)`, and `fvm::laplacian(rAtU(),p)` are in place and gated by `PIMPLE.useGpuFieldOps`.
+   - Boundary handling mirrors the CPU schemes; CPU fallback remains active when the GPU flag is unset or the context fails.
+2. **Turbulence GPU path** *(completed for k‑ε)*
+   - `kEpsilon::correct()` now updates `k`, `epsilon`, and `nut` on-device via `gpu::computeNutFromKEpsilon`, with boundary updates and host fallback intact.
+   - Keep auditing additional RAS variants/fvModels when they appear; mirror the same device-field pattern to avoid host/device thrash.
+3. **Kernel orchestration & caching** *(next active step)*
+   - Cache NVRTC output per compute capability so repeated launches reuse compiled PTX/fatbins.
+   - Batch short kernels (ddt/div/laplacian/nut, etc.) via CUDA Graphs to cut launch overhead.
+   - Introduce multi-stream execution to overlap device kernels with host-side assembly/reduction work.
+   - Add optional SoA-friendly accessors or layouts if profiling flags strided-load penalties.
 4. **Profiling, validation, and regression**
-   - Expand the timing CSV exports to include every new kernel; feed the data into the benchmark script for automated speed reports.
-   - Maintain `run/scripts/run_gpu_parity.sh` as the correctness gate and push `run/scripts/benchmark_gpu_speed.sh` below the ~35 s CPU baseline on pitzDaily before considering deployment.
+   - Expand timing CSV outputs to cover every GPU kernel and turbulence step; feed these into the benchmark scripts for automated reporting.
+   - Maintain the parity harness (`run/scripts/run_gpu_parity.sh`) and push `run/scripts/benchmark_gpu_speed.sh` below the ~35 s CPU baseline before deployment.
+5. **Boundary conditions & supplementary sources**
+   - Port common BCs (fixedValue, zeroGradient, inletOutlet, wall functions) and fvModel/fvConstraint sources to the GPU to eliminate forced fallbacks.
+   - Extend turbulence GPU coverage beyond νₜ if additional scalars/models are required.
+6. **Multi-GPU (MPI)**
+   - Add CUDA-aware halo exchanges (optionally GPUDirect) so decomposed runs keep fields resident; overlap comm/compute while preserving existing run scripts.
+7. **Hardening & docs**
+   - Wire CI hooks to build CPU+GPU targets, run pitzDaily, compare fields, and trend timings.
+   - Document the runtime flags (`PIMPLE.useGpuFieldOps`, turbulence `useGPU`, etc.) and finalise the deployment checklist before copying into `/opt/openfoam10`.
 
 
 ---

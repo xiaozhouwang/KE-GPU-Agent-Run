@@ -1,0 +1,5 @@
+GpuContext/GpuContext.C
+DeviceField/DeviceField.C
+FieldOps/FieldOps.C
+
+LIB = $(FOAM_USER_LIBBIN)/libgpuInfrastructure

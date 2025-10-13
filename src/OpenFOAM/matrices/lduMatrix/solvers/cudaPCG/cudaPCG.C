@@ -4,12 +4,25 @@
 #include "Switch.H"
 #include "List.H"
 #include "PstreamReduceOps.H"
+#include "DynamicList.H"
+#include "OFstream.H"
+#include "OSspecific.H"
+#include "Pstream.H"
+#include "Time.H"
 
 #include <algorithm>
+#include <cmath>
+#include <ios>
 #include <limits>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <vector>
 
 #ifdef FOAM_USE_CUDA
 #include <cuda_runtime.h>
+#include <cuda.h>
+#include <nvrtc.h>
 #define CUSPARSE_USE_DEPRECATED_API
 #include <cusparse_v2.h>
 #include <cusparse.h>
@@ -32,6 +45,374 @@ inline std::string toLower(const std::string& s)
     std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c){ return std::tolower(c); });
     return out;
 }
+
+#ifdef FOAM_USE_CUDA
+
+inline const char* cuStatusName(CUresult code)
+{
+    const char* name = nullptr;
+    if (code == CUDA_SUCCESS)
+    {
+        return "CUDA_SUCCESS";
+    }
+    if (cuGetErrorName(code, &name) != CUDA_SUCCESS || !name)
+    {
+        return "CUDA_ERROR_UNKNOWN";
+    }
+    return name;
+}
+
+inline const char* nvrtcStatusName(nvrtcResult code)
+{
+    return nvrtcGetErrorString(code);
+}
+
+static const char* colouredKernelSource = R"(
+#include <cuda_runtime.h>
+#include <math_functions.h>
+
+extern "C" __global__
+void colouredForwardSweep(
+    int count,
+    const int* __restrict__ rowIndices,
+    const int* __restrict__ rowPtr,
+    const int* __restrict__ colInd,
+    const double* __restrict__ values,
+    const int* __restrict__ colours,
+    const double* __restrict__ rhs,
+    double* __restrict__ x,
+    int colourId,
+    double omega,
+    double diagFloor,
+    int* __restrict__ failFlag
+)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= count)
+    {
+        return;
+    }
+
+    const int row = rowIndices[tid];
+    double sum = rhs[row];
+    double diag = 0.0;
+
+    for (int k = rowPtr[row]; k < rowPtr[row + 1]; ++k)
+    {
+        const int col = colInd[k];
+        const double val = values[k];
+        if (col == row)
+        {
+            diag = val;
+        }
+        else if (colours[col] < colourId)
+        {
+            sum -= val * x[col];
+        }
+    }
+
+    if (fabs(diag) <= diagFloor)
+    {
+        atomicMax(failFlag, 1);
+        return;
+    }
+
+    const double newVal = sum / diag;
+    const double oldVal = x[row];
+    const double updated = oldVal + omega * (newVal - oldVal);
+    if (!isfinite(updated))
+    {
+        atomicMax(failFlag, 2);
+    }
+    x[row] = updated;
+}
+
+extern "C" __global__
+void colouredBackwardSweep(
+    int count,
+    const int* __restrict__ rowIndices,
+    const int* __restrict__ rowPtr,
+    const int* __restrict__ colInd,
+    const double* __restrict__ values,
+    const int* __restrict__ colours,
+    const double* __restrict__ rhs,
+    double* __restrict__ x,
+    int colourId,
+    double omega,
+    double diagFloor,
+    int* __restrict__ failFlag
+)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= count)
+    {
+        return;
+    }
+
+    const int row = rowIndices[tid];
+    double sum = rhs[row];
+    double diag = 0.0;
+
+    for (int k = rowPtr[row]; k < rowPtr[row + 1]; ++k)
+    {
+        const int col = colInd[k];
+        const double val = values[k];
+        if (col == row)
+        {
+            diag = val;
+        }
+        else if (colours[col] > colourId)
+        {
+            sum -= val * x[col];
+        }
+    }
+
+    if (fabs(diag) <= diagFloor)
+    {
+        atomicMax(failFlag, 1);
+        return;
+    }
+
+    const double newVal = sum / diag;
+    const double oldVal = x[row];
+    const double updated = oldVal + omega * (newVal - oldVal);
+    if (!isfinite(updated))
+    {
+        atomicMax(failFlag, 2);
+    }
+    x[row] = updated;
+}
+)";
+
+struct ColourKernelCacheEntry
+{
+    int major;
+    int minor;
+    CUmodule module;
+    CUfunction forward;
+    CUfunction backward;
+    bool ok;
+};
+
+static std::mutex colourKernelMutex;
+static std::vector<ColourKernelCacheEntry> colourKernelCache;
+static std::once_flag driverInitFlag;
+static CUresult driverInitStatus = CUDA_SUCCESS;
+
+inline bool ensureDriverInitialised()
+{
+    std::call_once
+    (
+        driverInitFlag,
+        []()
+        {
+            driverInitStatus = cuInit(0);
+        }
+    );
+
+    return driverInitStatus == CUDA_SUCCESS;
+}
+
+bool compileColourKernels
+(
+    const cudaDeviceProp& prop,
+    ColourKernelCacheEntry& entry,
+    bool verbose
+)
+{
+    entry.major = prop.major;
+    entry.minor = prop.minor;
+    entry.module = nullptr;
+    entry.forward = nullptr;
+    entry.backward = nullptr;
+    entry.ok = false;
+
+    if (!ensureDriverInitialised())
+    {
+        if (verbose)
+        {
+            WarningInFunction << "cuInit failed: " << cuStatusName(driverInitStatus) << Foam::endl;
+        }
+        return false;
+    }
+
+    nvrtcProgram prog = nullptr;
+    nvrtcResult nvRes =
+        nvrtcCreateProgram
+        (
+            &prog,
+            colouredKernelSource,
+            "colouredPreconditioner.cu",
+            0,
+            nullptr,
+            nullptr
+        );
+
+    if (nvRes != NVRTC_SUCCESS)
+    {
+        if (verbose)
+        {
+            WarningInFunction << "nvrtcCreateProgram failed: " << nvrtcStatusName(nvRes) << Foam::endl;
+        }
+        return false;
+    }
+
+    std::ostringstream archOpt;
+    archOpt << "--gpu-architecture=compute_" << prop.major << prop.minor;
+    const std::string archStr = archOpt.str();
+
+    std::vector<const char*> compileOptions;
+    compileOptions.push_back(archStr.c_str());
+    compileOptions.push_back("--fmad=false");
+    compileOptions.push_back("--std=c++14");
+    compileOptions.push_back("-I/usr/include");
+    compileOptions.push_back("-I/usr/local/cuda/include");
+    compileOptions.push_back("-I/usr/include/x86_64-linux-gnu");
+
+    nvRes = nvrtcCompileProgram
+    (
+        prog,
+        static_cast<int>(compileOptions.size()),
+        compileOptions.data()
+    );
+
+    if (nvRes != NVRTC_SUCCESS)
+    {
+        if (verbose)
+        {
+            size_t logSize = 0;
+            nvrtcGetProgramLogSize(prog, &logSize);
+            std::string log(logSize, '\0');
+            nvrtcGetProgramLog(prog, &log[0]);
+            WarningInFunction
+                << "nvrtcCompileProgram failed (" << nvrtcStatusName(nvRes) << "):"
+                << Foam::nl << log.c_str() << Foam::endl;
+        }
+        nvrtcDestroyProgram(&prog);
+        return false;
+    }
+
+    size_t ptxSize = 0;
+    nvRes = nvrtcGetPTXSize(prog, &ptxSize);
+    if (nvRes != NVRTC_SUCCESS)
+    {
+        if (verbose)
+        {
+            WarningInFunction << "nvrtcGetPTXSize failed: " << nvrtcStatusName(nvRes) << Foam::endl;
+        }
+        nvrtcDestroyProgram(&prog);
+        return false;
+    }
+
+    std::string ptx(ptxSize, '\0');
+    nvRes = nvrtcGetPTX(prog, &ptx[0]);
+    nvrtcDestroyProgram(&prog);
+    if (nvRes != NVRTC_SUCCESS)
+    {
+        if (verbose)
+        {
+            WarningInFunction << "nvrtcGetPTX failed: " << nvrtcStatusName(nvRes) << Foam::endl;
+        }
+        return false;
+    }
+
+    CUresult cuRes =
+        cuModuleLoadDataEx
+        (
+            &entry.module,
+            static_cast<const void*>(ptx.data()),
+            0,
+            nullptr,
+            nullptr
+        );
+
+    if (cuRes != CUDA_SUCCESS)
+    {
+        if (verbose)
+        {
+            WarningInFunction << "cuModuleLoadDataEx failed: " << cuStatusName(cuRes) << Foam::endl;
+        }
+        entry.module = nullptr;
+        return false;
+    }
+
+    cuRes = cuModuleGetFunction(&entry.forward, entry.module, "colouredForwardSweep");
+    if (cuRes != CUDA_SUCCESS)
+    {
+        if (verbose)
+        {
+            WarningInFunction << "cuModuleGetFunction forward failed: " << cuStatusName(cuRes) << Foam::endl;
+        }
+        cuModuleUnload(entry.module);
+        entry.module = nullptr;
+        return false;
+    }
+
+    cuRes = cuModuleGetFunction(&entry.backward, entry.module, "colouredBackwardSweep");
+    if (cuRes != CUDA_SUCCESS)
+    {
+        if (verbose)
+        {
+            WarningInFunction << "cuModuleGetFunction backward failed: " << cuStatusName(cuRes) << Foam::endl;
+        }
+        cuModuleUnload(entry.module);
+        entry.module = nullptr;
+        entry.forward = nullptr;
+        return false;
+    }
+
+    entry.ok = true;
+    return true;
+}
+
+bool getColourKernels
+(
+    const int deviceId,
+    CUfunction& forward,
+    CUfunction& backward,
+    bool verbose
+)
+{
+    std::lock_guard<std::mutex> guard(colourKernelMutex);
+
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, deviceId) != cudaSuccess)
+    {
+        if (verbose)
+        {
+            WarningInFunction << "cudaGetDeviceProperties failed for device " << deviceId << Foam::endl;
+        }
+        return false;
+    }
+
+    for (const ColourKernelCacheEntry& entry : colourKernelCache)
+    {
+        if (entry.major == prop.major && entry.minor == prop.minor)
+        {
+            if (entry.ok)
+            {
+                forward = entry.forward;
+                backward = entry.backward;
+                return true;
+            }
+            return false;
+        }
+    }
+
+    ColourKernelCacheEntry entry;
+    if (compileColourKernels(prop, entry, verbose))
+    {
+        forward = entry.forward;
+        backward = entry.backward;
+        colourKernelCache.push_back(entry);
+        return true;
+    }
+
+    colourKernelCache.push_back(entry);
+    return false;
+}
+
+#endif // FOAM_USE_CUDA
 }
 
 Foam::cudaPCG::cudaPCG
@@ -191,6 +572,70 @@ bool Foam::cudaPCG::gpuSolve
     const bool reportStats =
         controlDict_.lookupOrDefault<Switch>("reportGpuStats", Switch(false));
 
+    const Switch logResidualTrajectorySwitch =
+        controlDict_.lookupOrDefault<Switch>("logResidualTrajectory", Switch(false));
+    const bool logResidualTrajectory = bool(logResidualTrajectorySwitch);
+
+    const Switch pipelinedSwitch =
+        controlDict_.lookupOrDefault<Switch>("usePipelinedCG", Switch(false));
+    const bool usePipelinedCG = bool(pipelinedSwitch);
+
+    const Switch cudaGraphSwitch =
+        controlDict_.lookupOrDefault<Switch>("useCudaGraph", Switch(false));
+    const bool useCudaGraph = bool(cudaGraphSwitch);
+    const label cudaGraphWarmup =
+        std::max<label>(0, controlDict_.lookupOrDefault<label>("cudaGraphWarmup", 5));
+
+    const label residualLogEvery =
+        std::max<label>(1, controlDict_.lookupOrDefault<label>("residualLogEvery", 1));
+
+    fileName residualLogFile =
+        controlDict_.lookupOrDefault<fileName>("residualLogFile", fileName::null);
+
+    const Switch logColourStatsSwitch =
+        controlDict_.lookupOrDefault<Switch>("logColourStats", Switch(reportStats));
+    const bool logColourStats = bool(logColourStatsSwitch);
+
+    fileName colourStatsFile =
+        controlDict_.lookupOrDefault<fileName>("colourStatsFile", fileName::null);
+
+    if (logResidualTrajectory && residualLogFile == fileName::null)
+    {
+        residualLogFile =
+            fileName("postProcessing/cudaPCG/" + fieldName_ + "_residual.csv");
+    }
+
+    if ((logColourStats || reportStats) && colourStatsFile == fileName::null)
+    {
+        colourStatsFile =
+            fileName("postProcessing/cudaPCG/" + fieldName_ + "_colour.csv");
+    }
+
+    std::vector<label> residualIterHistory;
+    std::vector<scalar> residualValueHistory;
+    if (logResidualTrajectory)
+    {
+        residualIterHistory.reserve(maxIter_ + 2);
+        residualValueHistory.reserve(maxIter_ + 2);
+    }
+
+    bool telemetryWritten = false;
+    bool colourInitiallyRequested = false;
+    bool colourBuiltSuccessfully = false;
+    bool colourAppliedSuccessfully = false;
+    label colourSetCount = 0;
+    label colourMinSize = 0;
+    label colourMaxSize = 0;
+    scalar colourAvgSize = 0;
+    label colourDisableCount = 0;
+    std::vector<std::string> colourDisableEvents;
+    bool colourFallbackTriggered = false;
+
+    cudaStream_t computeStream = nullptr;
+    cudaGraph_t spmvGraph = nullptr;
+    cudaGraphExec_t spmvGraphExec = nullptr;
+    bool spmvGraphReady = false;
+
     cudaError_t cudaCode = cudaSetDevice(deviceId);
     if (cudaCode != cudaSuccess)
     {
@@ -203,20 +648,6 @@ bool Foam::cudaPCG::gpuSolve
     {
         message = "CSR row mismatch";
         return false;
-    }
-
-    if (reportStats)
-    {
-        const scalarField& diag = matrix_.diag();
-        scalar minDiag = std::numeric_limits<scalar>::max();
-        scalar maxDiag = -std::numeric_limits<scalar>::max();
-        for (const scalar d : diag)
-        {
-            minDiag = std::min(minDiag, d);
-            maxDiag = std::max(maxDiag, d);
-        }
-        Info<< "cudaPCG: diagonal range [" << minDiag << ", " << maxDiag << "]"
-            << nl;
     }
 
     static_assert(sizeof(scalar) == sizeof(double), "cudaPCG currently requires double precision build");
@@ -238,6 +669,20 @@ bool Foam::cudaPCG::gpuSolve
     }
 
     const scalarField& diag = matrix_.diag();
+    scalar minDiag = std::numeric_limits<scalar>::max();
+    scalar maxDiag = -std::numeric_limits<scalar>::max();
+    for (const scalar d : diag)
+    {
+        minDiag = std::min(minDiag, d);
+        maxDiag = std::max(maxDiag, d);
+    }
+
+    if (reportStats)
+    {
+        Info<< "cudaPCG: diagonal range [" << minDiag << ", " << maxDiag << "]"
+            << nl;
+    }
+
     List<DeviceScalar> diagInv(diag.size());
     forAll(diag, i)
     {
@@ -249,14 +694,76 @@ bool Foam::cudaPCG::gpuSolve
     DeviceScalar *d_r=nullptr, *d_p=nullptr, *d_Ap=nullptr;
     DeviceScalar *d_z=nullptr, *d_diagInv=nullptr;
     int *d_rowPtr=nullptr, *d_colInd=nullptr;
+    int *d_colors=nullptr, *d_colorIndices=nullptr;
+    int *d_failFlag=nullptr;
 
-    // Optional SGS preconditioner (D+L) solves
+    // Preconditioner configuration
+    const word preconditionerWord = controlDict_.lookupOrDefault<word>("preconditioner", word("diagonal"));
+    const std::string precondLower = toLower(preconditionerWord);
+
+    bool useColour = false;
     bool useSGS = false;
+
+    if
+    (
+        precondLower == "colour"
+     || precondLower == "coloured"
+     || precondLower == "colored"
+     || precondLower == "multicolour"
+     || precondLower == "multicolor"
+     || precondLower == "colorgs"
+     || precondLower == "colourgs"
+    )
     {
-        const word precName = controlDict_.lookupOrDefault<word>("preconditioner", word("diagonal"));
-        const std::string pl = toLower(precName);
-        useSGS = (pl == "sgs" || pl == "symgaussseidel" || pl == "ic" || pl == "dic");
+        useColour = true;
     }
+    else if
+    (
+        precondLower == "sgs"
+     || precondLower == "symgaussseidel"
+     || precondLower == "ic"
+     || precondLower == "dic"
+    )
+    {
+        useSGS = true;
+    }
+
+    colourInitiallyRequested = useColour;
+
+    label polySweepsCfg = controlDict_.lookupOrDefault<label>("polyJacobiSweeps", 0);
+    scalar jacOmegaCfg = controlDict_.lookupOrDefault<scalar>("jacobiOmega", scalar(0.7));
+    const Switch polyAuto = controlDict_.lookupOrDefault<Switch>("polyJacobiAuto", Switch(true));
+    bool usePolyJacobi = (!useColour && !useSGS) && ((polySweepsCfg > 0) || polyAuto);
+    label polySweepsEff = polySweepsCfg;
+    double jacOmegaEff = static_cast<double>(jacOmegaCfg);
+
+    const scalar colourOmegaCfg = controlDict_.lookupOrDefault<scalar>("colourOmega", scalar(0.65));
+    const scalar colourBackwardOmegaCfg = controlDict_.lookupOrDefault<scalar>("colourBackwardOmega", scalar(0.85));
+    const scalar colourDiagFloorCfg = controlDict_.lookupOrDefault<scalar>("colourDiagFloor", scalar(1e-12));
+    const label colourBlockSizeCfg =
+        std::max<label>
+        (
+            32,
+            std::min<label>(1024, controlDict_.lookupOrDefault<label>("colourBlockSize", 128))
+        );
+    const bool colourVerbose =
+        controlDict_.lookupOrDefault<Switch>("colourVerbose", Switch(false));
+
+    const double colourOmegaEff = std::max(0.0, std::min(1.0, static_cast<double>(colourOmegaCfg)));
+    const double colourBackwardOmegaEff = std::max(0.0, std::min(1.0, static_cast<double>(colourBackwardOmegaCfg)));
+    const double colourDiagFloor = std::max(1e-30, static_cast<double>(colourDiagFloorCfg));
+    const int colourBlockSize = static_cast<int>(colourBlockSizeCfg);
+
+    cudaPCGDetail::Colouring colouring;
+    List<int> colourPtrHost;
+    List<int> colourIndicesHost;
+    List<int> colourOfRowHost;
+    label nColourSets = 0;
+    bool colourReady = false;
+    bool colourOperational = false;
+    CUfunction colourForwardKernel = nullptr;
+    CUfunction colourBackwardKernel = nullptr;
+
     int *d_preRowPtr=nullptr, *d_preColInd=nullptr;
     DeviceScalar *d_preVals=nullptr, *d_preTmp=nullptr, *d_preTmp2=nullptr;
     cusparseSpMatDescr_t matDL = nullptr; // (D+L)
@@ -270,6 +777,246 @@ bool Foam::cudaPCG::gpuSolve
     cusparseDnVecDescr_t vecX = nullptr;
     cusparseDnVecDescr_t vecY = nullptr;
     void* spmvBuffer = nullptr;
+
+    if (useColour)
+    {
+        colouring = cudaPCGDetail::buildGreedyColouring(matrix_);
+        nColourSets = colouring.nColours;
+
+        const bool validColouring =
+        (
+            nColourSets > 0
+         && colouring.colourPtr.size() == static_cast<label>(nColourSets + 1)
+         && colouring.colourIndices.size() == csrMatrix.nRows
+         && colouring.cellToColour.size() == csrMatrix.nRows
+        );
+
+        if (!validColouring)
+        {
+            if (colourVerbose || reportStats)
+            {
+                Info
+                    << "cudaPCG: disabling coloured preconditioner (colouring invalid)"
+                    << nl;
+            }
+            colourFallbackTriggered = true;
+            ++colourDisableCount;
+            colourDisableEvents.push_back("invalidColouring");
+            useColour = false;
+        }
+        else
+        {
+            colourPtrHost.setSize(nColourSets + 1);
+            colourIndicesHost.setSize(rows);
+            colourOfRowHost.setSize(rows);
+
+            for (label i = 0; i <= nColourSets; ++i)
+            {
+                colourPtrHost[i] = static_cast<int>(colouring.colourPtr[i]);
+            }
+            for (int i = 0; i < rows; ++i)
+            {
+                colourIndicesHost[i] = static_cast<int>(colouring.colourIndices[i]);
+                colourOfRowHost[i] = static_cast<int>(colouring.cellToColour[i]);
+            }
+
+            colourReady = true;
+            colourOperational = true;
+            colourBuiltSuccessfully = true;
+            colourSetCount = nColourSets;
+
+            if (nColourSets > 0)
+            {
+                label minColourSizeLocal = std::numeric_limits<label>::max();
+                label maxColourSizeLocal = 0;
+                scalar sumColourSize = 0;
+                for (label colourI = 0; colourI < nColourSets; ++colourI)
+                {
+                    const label size =
+                        colourPtrHost[colourI + 1] - colourPtrHost[colourI];
+                    minColourSizeLocal = min(minColourSizeLocal, size);
+                    maxColourSizeLocal = max(maxColourSizeLocal, size);
+                    sumColourSize += size;
+                }
+                colourMinSize = minColourSizeLocal;
+                colourMaxSize = maxColourSizeLocal;
+                colourAvgSize = sumColourSize/static_cast<scalar>(nColourSets);
+            }
+            else
+            {
+                colourMinSize = 0;
+                colourMaxSize = 0;
+                colourAvgSize = 0;
+            }
+
+            if (colourVerbose || reportStats)
+            {
+                Info<< "cudaPCG: coloured preconditioner using " << nColourSets << " colour sets" << nl;
+            }
+        }
+    }
+
+    auto disableColour = [&](const char* stage)
+    {
+        if (colourVerbose || reportStats)
+        {
+            Info<< "cudaPCG: coloured preconditioner disabled (" << stage << ')' << nl;
+        }
+        colourFallbackTriggered = true;
+        ++colourDisableCount;
+        colourDisableEvents.push_back(stage ? std::string(stage) : std::string("unspecified"));
+        if (d_colors)
+        {
+            cudaFree(d_colors);
+            d_colors = nullptr;
+        }
+        if (d_colorIndices)
+        {
+            cudaFree(d_colorIndices);
+            d_colorIndices = nullptr;
+        }
+        if (d_failFlag)
+        {
+            cudaFree(d_failFlag);
+            d_failFlag = nullptr;
+        }
+        colourReady = false;
+        colourOperational = false;
+        useColour = false;
+    };
+
+    auto writeTelemetry =
+        [&](const bool success, const word& failureMessage)
+    {
+        if (telemetryWritten)
+        {
+            return;
+        }
+        telemetryWritten = true;
+
+        const bool master = Pstream::master();
+        const Time& runTime = matrix_.mesh().thisDb().time();
+
+        auto resolvePath = [&](const fileName& fName) -> fileName
+        {
+            if (fName == fileName::null)
+            {
+                return fName;
+            }
+            if (fName.isAbsolute())
+            {
+                return fName;
+            }
+            return runTime.globalPath()/fName;
+        };
+
+        if (logResidualTrajectory && !residualValueHistory.empty() && master)
+        {
+            const fileName resolved = resolvePath(residualLogFile);
+            const fileName residualParent = resolved.path();
+            if (!residualParent.empty())
+            {
+                mkDir(residualParent);
+            }
+            OFstream os(resolved);
+            os.setf(std::ios::scientific);
+            os.precision(IOstream::defaultPrecision());
+            os<< "# cudaPCG residual trajectory for " << fieldName_ << nl;
+            os<< "# success," << (success ? "true" : "false") << nl;
+            if (failureMessage.size())
+            {
+                os<< "# failure," << failureMessage << nl;
+            }
+            os<< "iteration,residual" << nl;
+            for (std::size_t i = 0; i < residualValueHistory.size(); ++i)
+            {
+                os<< residualIterHistory[i] << ',' << residualValueHistory[i] << nl;
+            }
+            Info<< "cudaPCG(" << fieldName_ << "): residual log -> " << resolved << nl;
+        }
+
+        const bool colourActiveFinal = useColour && colourOperational;
+        const bool emitColourSummary =
+            colourInitiallyRequested && (reportStats || colourVerbose || logColourStats);
+        const bool masterHasColourData =
+            colourInitiallyRequested && master;
+
+        std::ostringstream disableSummary;
+        if (!colourDisableEvents.empty())
+        {
+            for (std::size_t i = 0; i < colourDisableEvents.size(); ++i)
+            {
+                if (i)
+                {
+                    disableSummary << '|';
+                }
+                disableSummary << colourDisableEvents[i];
+            }
+        }
+
+        if (emitColourSummary && master)
+        {
+            Info<< "cudaPCG(" << fieldName_ << "): colour sets=" << colourSetCount
+                << " size[min,max,avg]=[" << colourMinSize << ',' << colourMaxSize
+                << ',' << colourAvgSize << ']'
+                << " omegaF=" << colourOmegaEff
+                << " omegaB=" << colourBackwardOmegaEff
+                << " diagFloor=" << colourDiagFloor
+                << " built=" << (colourBuiltSuccessfully ? "true" : "false")
+                << " applied=" << (colourAppliedSuccessfully ? "true" : "false")
+                << " activeFinal=" << (colourActiveFinal ? "true" : "false")
+                << " disables=" << colourDisableCount;
+            if (colourFallbackTriggered)
+            {
+                Info<< " (fallback triggered)";
+            }
+            Info<< nl;
+            if (!colourDisableEvents.empty())
+            {
+                Info<< "cudaPCG(" << fieldName_ << "): colour disable history "
+                    << disableSummary.str() << nl;
+            }
+        }
+
+        if ((reportStats || logColourStats) && masterHasColourData)
+        {
+            const fileName resolved = resolvePath(colourStatsFile);
+            const fileName colourParent = resolved.path();
+            if (!colourParent.empty())
+            {
+                mkDir(colourParent);
+            }
+            OFstream os(resolved);
+            os.setf(std::ios::scientific);
+            os.precision(IOstream::defaultPrecision());
+            os<< "# cudaPCG colour statistics for " << fieldName_ << nl;
+            os<< "# success," << (success ? "true" : "false") << nl;
+            if (failureMessage.size())
+            {
+                os<< "# failure," << failureMessage << nl;
+            }
+            os<< "nColours,minSize,maxSize,avgSize,diagFloor,omegaForward,omegaBackward,diagMin,diagMax,built,applied,activeFinal,disableCount,disableStages" << nl;
+            os<< colourSetCount << ','
+               << colourMinSize << ','
+               << colourMaxSize << ','
+               << colourAvgSize << ','
+               << colourDiagFloor << ','
+               << colourOmegaEff << ','
+               << colourBackwardOmegaEff << ','
+               << minDiag << ','
+               << maxDiag << ','
+               << (colourBuiltSuccessfully ? 1 : 0) << ','
+               << (colourAppliedSuccessfully ? 1 : 0) << ','
+               << (colourActiveFinal ? 1 : 0) << ','
+               << colourDisableCount << ',';
+            if (!colourDisableEvents.empty())
+            {
+                os<< disableSummary.str();
+            }
+            os<< nl;
+            Info<< "cudaPCG(" << fieldName_ << "): colour stats -> " << resolved << nl;
+        }
+    };
 
     auto cleanup = [&]()
     {
@@ -313,6 +1060,9 @@ bool Foam::cudaPCG::gpuSolve
         if (d_diagInv) cudaFree(d_diagInv);
         if (d_rowPtr) cudaFree(d_rowPtr);
         if (d_colInd) cudaFree(d_colInd);
+        if (d_colors) cudaFree(d_colors);
+        if (d_colorIndices) cudaFree(d_colorIndices);
+        if (d_failFlag) cudaFree(d_failFlag);
         if (d_preRowPtr) cudaFree(d_preRowPtr);
         if (d_preColInd) cudaFree(d_preColInd);
         if (d_preVals) cudaFree(d_preVals);
@@ -324,13 +1074,44 @@ bool Foam::cudaPCG::gpuSolve
         if (spsvUpperT) cusparseSpSV_destroyDescr(spsvUpperT);
         if (spsvBuf) cudaFree(spsvBuf);
         if (d_preTmp2) cudaFree(d_preTmp2);
+        if (spmvGraphExec)
+        {
+            cudaGraphExecDestroy(spmvGraphExec);
+            spmvGraphExec = nullptr;
+        }
+        if (spmvGraph)
+        {
+            cudaGraphDestroy(spmvGraph);
+            spmvGraph = nullptr;
+        }
+        if (computeStream)
+        {
+            cudaStreamDestroy(computeStream);
+            computeStream = nullptr;
+        }
     };
 
     auto fail = [&](const word& msg)
     {
         cleanup();
         message = msg;
+        writeTelemetry(false, msg);
         return false;
+    };
+
+    auto syncStream = [&]() -> bool
+    {
+        if (!computeStream)
+        {
+            return true;
+        }
+        if (cudaStreamSynchronize(computeStream) != cudaSuccess)
+        {
+            message = word("cudaStreamSyncFail");
+            cleanup();
+            return false;
+        }
+        return true;
     };
 
     // Allocate
@@ -369,10 +1150,56 @@ bool Foam::cudaPCG::gpuSolve
     if (cudaMemcpy(d_diagInv, diagInv.begin(), sizeof(DeviceScalar)*rows, cudaMemcpyHostToDevice) != cudaSuccess)
         return fail("cudaMemcpy(diagInv)");
 
+    if (colourReady)
+    {
+        if (cudaMalloc(reinterpret_cast<void**>(&d_colors), sizeof(int)*rows) != cudaSuccess)
+        {
+            disableColour("cudaMalloc colours");
+        }
+        else if (cudaMalloc(reinterpret_cast<void**>(&d_colorIndices), sizeof(int)*rows) != cudaSuccess)
+        {
+            d_colorIndices = nullptr;
+            disableColour("cudaMalloc colourIndices");
+        }
+        else if (cudaMalloc(reinterpret_cast<void**>(&d_failFlag), sizeof(int)) != cudaSuccess)
+        {
+            d_failFlag = nullptr;
+            disableColour("cudaMalloc colourFlag");
+        }
+        else if
+        (
+            cudaMemcpy(d_colors, colourOfRowHost.begin(), sizeof(int)*rows, cudaMemcpyHostToDevice) != cudaSuccess
+         || cudaMemcpy(d_colorIndices, colourIndicesHost.begin(), sizeof(int)*rows, cudaMemcpyHostToDevice) != cudaSuccess
+        )
+        {
+            disableColour("cudaMemcpy colourData");
+        }
+        else if (!getColourKernels(deviceId, colourForwardKernel, colourBackwardKernel, colourVerbose || reportStats))
+        {
+            disableColour("kernelCompile");
+        }
+    }
+
     if (cusparseCreate(&cusparseHandle) != CUSPARSE_STATUS_SUCCESS)
         return fail("cusparseCreate");
     if (cublasCreate(&cublasHandle) != CUBLAS_STATUS_SUCCESS)
         return fail("cublasCreate");
+
+    if (usePipelinedCG || useCudaGraph)
+    {
+        if (cudaStreamCreateWithFlags(&computeStream, cudaStreamNonBlocking) != cudaSuccess)
+        {
+            return fail("cudaStreamCreate");
+        }
+        if (cublasSetStream(cublasHandle, computeStream) != CUBLAS_STATUS_SUCCESS)
+        {
+            return fail("cublasSetStream");
+        }
+        if (cusparseSetStream(cusparseHandle, computeStream) != CUSPARSE_STATUS_SUCCESS)
+        {
+            return fail("cusparseSetStream");
+        }
+    }
 
     if
     (
@@ -402,12 +1229,6 @@ bool Foam::cudaPCG::gpuSolve
 
     // Build optional SGS preconditioner structures: CSR of (D+L)
     bool sgsReady = false;
-    label polySweepsCfg = controlDict_.lookupOrDefault<label>("polyJacobiSweeps", 0);
-    scalar jacOmegaCfg = controlDict_.lookupOrDefault<scalar>("jacobiOmega", scalar(0.7));
-    const Switch polyAuto = controlDict_.lookupOrDefault<Switch>("polyJacobiAuto", Switch(true));
-    bool usePolyJacobi = (polySweepsCfg > 0) || polyAuto;
-    label polySweepsEff = polySweepsCfg;
-    double jacOmegaEff = static_cast<double>(jacOmegaCfg);
     int preRows = 0, preNnz = 0;
     if (useSGS)
     {
@@ -560,6 +1381,298 @@ bool Foam::cudaPCG::gpuSolve
         }
     }
 
+    if ((usePolyJacobi || useColour) && !d_preTmp)
+    {
+        if (cudaMalloc(reinterpret_cast<void**>(&d_preTmp), sizeof(DeviceScalar)*rows) != cudaSuccess)
+        {
+            return fail("cudaMalloc(preTmp)");
+        }
+    }
+    if (usePolyJacobi && !d_preTmp2)
+    {
+        if (cudaMalloc(reinterpret_cast<void**>(&d_preTmp2), sizeof(DeviceScalar)*rows) != cudaSuccess)
+        {
+            return fail("cudaMalloc(preTmp2)");
+        }
+    }
+
+    auto applyDiagonalDevice =
+        [&](const double* rhsVec, double* outVec) -> bool
+    {
+        if (cublasDcopy(cublasHandle, rows, rhsVec, 1, outVec, 1) != CUBLAS_STATUS_SUCCESS)
+        {
+            message = word("DiagCopyFail");
+            return false;
+        }
+        if
+        (
+            cublasDdgmm
+            (
+                cublasHandle,
+                CUBLAS_SIDE_LEFT,
+                rows,
+                1,
+                outVec,
+                rows,
+                reinterpret_cast<const double*>(d_diagInv),
+                1,
+                outVec,
+                rows
+            ) != CUBLAS_STATUS_SUCCESS
+        )
+        {
+            message = word("DiagScaleFail");
+            return false;
+        }
+        return true;
+    };
+
+    auto applyColourDevice =
+        [&](const double* rhsVec, double* outVec, const char* stage) -> bool
+    {
+        (void)stage;
+        if (!colourOperational || !colourReady)
+        {
+            return false;
+        }
+        if (!d_preTmp || !d_colors || !d_colorIndices || !d_failFlag || !colourForwardKernel || !colourBackwardKernel)
+        {
+            disableColour("missingResources");
+            return false;
+        }
+
+        if (cudaMemset(d_preTmp, 0, sizeof(DeviceScalar)*rows) != cudaSuccess)
+        {
+            disableColour("zeroForward");
+            return false;
+        }
+        if (cudaMemset(outVec, 0, sizeof(DeviceScalar)*rows) != cudaSuccess)
+        {
+            disableColour("zeroResult");
+            return false;
+        }
+
+        int zeroFlag = 0;
+        if (cudaMemcpy(d_failFlag, &zeroFlag, sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess)
+        {
+            disableColour("resetFlag");
+            return false;
+        }
+
+        const double diagFloorLocal = colourDiagFloor;
+        const double omegaForward = colourOmegaEff;
+        const double omegaBackward = colourBackwardOmegaEff;
+
+        for (label colour = 0; colour < nColourSets; ++colour)
+        {
+            const label start = colourPtrHost[colour];
+            const int count = static_cast<int>(colourPtrHost[colour+1] - start);
+            if (!count)
+            {
+                continue;
+            }
+
+            const int* rowIdxDev = d_colorIndices + start;
+            const int* rowPtrDev = d_rowPtr;
+            const int* colIndDev = d_colInd;
+            const double* valDev = reinterpret_cast<const double*>(d_vals);
+            const int* coloursDev = d_colors;
+            const double* rhsDev = rhsVec;
+            double* solDev = reinterpret_cast<double*>(d_preTmp);
+            int colourId = static_cast<int>(colour);
+            double omegaLocal = omegaForward;
+            double diagFloorPass = diagFloorLocal;
+            int* failDev = d_failFlag;
+
+            int countLocal = count;
+            void* args[] =
+            {
+                reinterpret_cast<void*>(&countLocal),
+                reinterpret_cast<void*>(&rowIdxDev),
+                reinterpret_cast<void*>(&rowPtrDev),
+                reinterpret_cast<void*>(&colIndDev),
+                reinterpret_cast<void*>(&valDev),
+                reinterpret_cast<void*>(&coloursDev),
+                reinterpret_cast<void*>(&rhsDev),
+                reinterpret_cast<void*>(&solDev),
+                reinterpret_cast<void*>(&colourId),
+                reinterpret_cast<void*>(&omegaLocal),
+                reinterpret_cast<void*>(&diagFloorPass),
+                reinterpret_cast<void*>(&failDev)
+            };
+
+            const int blocks = (count + colourBlockSize - 1)/colourBlockSize;
+            if (blocks <= 0)
+            {
+                continue;
+            }
+
+            CUresult launch =
+                cuLaunchKernel
+                (
+                    colourForwardKernel,
+                    blocks, 1, 1,
+                    colourBlockSize, 1, 1,
+                    0,
+                    nullptr,
+                    args,
+                    nullptr
+                );
+
+            if (launch != CUDA_SUCCESS)
+            {
+                disableColour("launchForward");
+                return false;
+            }
+
+            cudaError_t kernelErr = cudaGetLastError();
+            if (kernelErr != cudaSuccess)
+            {
+                disableColour("forwardKernel");
+                return false;
+            }
+        }
+
+        int failHost = 0;
+        if (cudaMemcpy(&failHost, d_failFlag, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess)
+        {
+            disableColour("forwardFlag");
+            return false;
+        }
+        if (failHost != 0)
+        {
+            if (failHost == 1)
+            {
+                disableColour("forwardDiagFloor");
+            }
+            else if (failHost == 2)
+            {
+                disableColour("forwardNonFinite");
+            }
+            else
+            {
+                disableColour("forwardInstability");
+            }
+            return false;
+        }
+
+        if (cudaMemcpy(d_failFlag, &zeroFlag, sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess)
+        {
+            disableColour("resetFlagBack");
+            return false;
+        }
+
+        if
+        (
+            cudaMemcpy
+            (
+                outVec,
+                d_preTmp,
+                sizeof(DeviceScalar)*rows,
+                cudaMemcpyDeviceToDevice
+            ) != cudaSuccess
+        )
+        {
+            disableColour("prepBackward");
+            return false;
+        }
+
+        for (label colour = nColourSets; colour-- > 0; )
+        {
+            const label start = colourPtrHost[colour];
+            const int count = static_cast<int>(colourPtrHost[colour+1] - start);
+            if (!count)
+            {
+                continue;
+            }
+
+            const int* rowIdxDev = d_colorIndices + start;
+            const int* rowPtrDev = d_rowPtr;
+            const int* colIndDev = d_colInd;
+            const double* valDev = reinterpret_cast<const double*>(d_vals);
+            const int* coloursDev = d_colors;
+            const double* rhsDev = reinterpret_cast<const double*>(d_preTmp);
+            double* solDev = outVec;
+            int colourId = static_cast<int>(colour);
+            double omegaLocal = omegaBackward;
+            double diagFloorPass = diagFloorLocal;
+            int* failDev = d_failFlag;
+
+            int countLocal = count;
+            void* args[] =
+            {
+                reinterpret_cast<void*>(&countLocal),
+                reinterpret_cast<void*>(&rowIdxDev),
+                reinterpret_cast<void*>(&rowPtrDev),
+                reinterpret_cast<void*>(&colIndDev),
+                reinterpret_cast<void*>(&valDev),
+                reinterpret_cast<void*>(&coloursDev),
+                reinterpret_cast<void*>(&rhsDev),
+                reinterpret_cast<void*>(&solDev),
+                reinterpret_cast<void*>(&colourId),
+                reinterpret_cast<void*>(&omegaLocal),
+                reinterpret_cast<void*>(&diagFloorPass),
+                reinterpret_cast<void*>(&failDev)
+            };
+
+            const int blocks = (count + colourBlockSize - 1)/colourBlockSize;
+            if (blocks <= 0)
+            {
+                continue;
+            }
+
+            CUresult launch =
+                cuLaunchKernel
+                (
+                    colourBackwardKernel,
+                    blocks, 1, 1,
+                    colourBlockSize, 1, 1,
+                    0,
+                    nullptr,
+                    args,
+                    nullptr
+                );
+
+            if (launch != CUDA_SUCCESS)
+            {
+                disableColour("launchBackward");
+                return false;
+            }
+
+            cudaError_t kernelErr = cudaGetLastError();
+            if (kernelErr != cudaSuccess)
+            {
+                disableColour("backwardKernel");
+                return false;
+            }
+        }
+
+        if (cudaMemcpy(&failHost, d_failFlag, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess)
+        {
+            disableColour("backwardFlag");
+            return false;
+        }
+        if (failHost != 0)
+        {
+            if (failHost == 1)
+            {
+                disableColour("backwardDiagFloor");
+            }
+            else if (failHost == 2)
+            {
+                disableColour("backwardNonFinite");
+            }
+            else
+            {
+                disableColour("backwardInstability");
+            }
+            return false;
+        }
+
+        colourAppliedSuccessfully = true;
+        return true;
+    };
+
     auto applyPreconditionerVec =
         [&](const double* rhs, double* out, const char* stage) -> bool
     {
@@ -627,6 +1740,8 @@ bool Foam::cudaPCG::gpuSolve
                 cusparseDestroyDnVec(vpy);
                 if (spmvStat != CUSPARSE_STATUS_SUCCESS)
                 { message = word("PolySpMVFail"); return false; }
+                if (computeStream && cudaStreamSynchronize(computeStream) != cudaSuccess)
+                { message = word("PolyStreamSyncFail"); return false; }
 
                 // d_preTmp = rhs - t
                 if (cublasDcopy(cublasHandle, rows, rhs, 1, d_preTmp, 1) != CUBLAS_STATUS_SUCCESS)
@@ -754,36 +1869,16 @@ bool Foam::cudaPCG::gpuSolve
             }
             return true;
         }
-        else
+        else if (colourOperational && colourReady)
         {
-            // Diagonal scaling (Jacobi)
-            if (cublasDcopy(cublasHandle, rows, rhs, 1, out, 1) != CUBLAS_STATUS_SUCCESS)
+            if (applyColourDevice(rhs, out, stage))
             {
-                message = word("DiagCopyFail");
-                return false;
+                return true;
             }
-            if
-            (
-                cublasDdgmm
-                (
-                    cublasHandle,
-                    CUBLAS_SIDE_LEFT,
-                    rows,
-                    1,
-                    out,
-                    rows,
-                    reinterpret_cast<const double*>(d_diagInv),
-                    1,
-                    out,
-                    rows
-                ) != CUBLAS_STATUS_SUCCESS
-            )
-            {
-                message = word("DiagScaleFail");
-                return false;
-            }
-            return true;
+            // applyColourDevice disables the coloured path on failure – fall through to diagonal
         }
+
+        return applyDiagonalDevice(rhs, out);
     };
 
     const double alpha = 1.0;
@@ -957,6 +2052,10 @@ bool Foam::cudaPCG::gpuSolve
     {
         return fail("cusparseSpMV (A*x)");
     }
+    if (!syncStream())
+    {
+        return false;
+    }
 
     if (cublasDcopy(cublasHandle, rows, reinterpret_cast<const double*>(d_b), 1, reinterpret_cast<double*>(d_r), 1) != CUBLAS_STATUS_SUCCESS)
         return fail("cublas copy b->r");
@@ -981,6 +2080,10 @@ bool Foam::cudaPCG::gpuSolve
         cleanup();
         return fail("cublas dot(r,z)");
     }
+    if (!syncStream())
+    {
+        return false;
+    }
     scalar rz = returnReduce(static_cast<scalar>(rzDevice), sumOp<scalar>());
 
     scalar normFactor = this->normFactor(psi, source, wA, pA);
@@ -991,10 +2094,20 @@ bool Foam::cudaPCG::gpuSolve
         cleanup();
         return fail("cublas dasum(r)");
     }
+    if (!syncStream())
+    {
+        return false;
+    }
     scalar sumAbs = returnReduce(static_cast<scalar>(sumAbsDevice), sumOp<scalar>());
 
     solverPerf.initialResidual() = sumAbs/normFactor;
     solverPerf.finalResidual() = solverPerf.initialResidual();
+
+    if (logResidualTrajectory)
+    {
+        residualIterHistory.push_back(0);
+        residualValueHistory.push_back(solverPerf.initialResidual());
+    }
 
     if
     (
@@ -1004,6 +2117,7 @@ bool Foam::cudaPCG::gpuSolve
     {
         cudaMemcpy(psi.begin(), d_x, sizeof(DeviceScalar)*rows, cudaMemcpyDeviceToHost);
         cleanup();
+        writeTelemetry(true, word::null);
         return true;
     }
 
@@ -1018,26 +2132,96 @@ bool Foam::cudaPCG::gpuSolve
      || iter < minIter_
     )
     {
-        if
-        (
-            cusparseDnVecSetValues(vecX, d_p) != CUSPARSE_STATUS_SUCCESS
-         || cusparseDnVecSetValues(vecY, d_Ap) != CUSPARSE_STATUS_SUCCESS
-         || cusparseSpMV
-            (
-                cusparseHandle,
-                CUSPARSE_OPERATION_NON_TRANSPOSE,
-                &alpha,
-                matA,
-                vecX,
-                &zero,
-                vecY,
-                CUDA_R_64F,
-                CUSPARSE_SPMV_ALG_DEFAULT,
-                spmvBuffer
-            ) != CUSPARSE_STATUS_SUCCESS
-        )
+        if (cusparseDnVecSetValues(vecX, d_p) != CUSPARSE_STATUS_SUCCESS)
         {
-            return fail("cusparseSpMV (A*p)");
+            return fail("cusparseSetVec(p)");
+        }
+        if (cusparseDnVecSetValues(vecY, d_Ap) != CUSPARSE_STATUS_SUCCESS)
+        {
+            return fail("cusparseSetVec(Ap)");
+        }
+
+        bool launchedFromGraph = false;
+        if (useCudaGraph)
+        {
+            cudaStream_t activeStream = computeStream ? computeStream : nullptr;
+            if (!spmvGraphReady && iter >= cudaGraphWarmup)
+            {
+                if (cudaStreamBeginCapture(activeStream, cudaStreamCaptureModeGlobal) != cudaSuccess)
+                {
+                    return fail("cudaStreamBeginCapture");
+                }
+                cusparseStatus_t capStatus =
+                    cusparseSpMV
+                    (
+                        cusparseHandle,
+                        CUSPARSE_OPERATION_NON_TRANSPOSE,
+                        &alpha,
+                        matA,
+                        vecX,
+                        &zero,
+                        vecY,
+                        CUDA_R_64F,
+                        CUSPARSE_SPMV_ALG_DEFAULT,
+                        spmvBuffer
+                    );
+                if (capStatus != CUSPARSE_STATUS_SUCCESS)
+                {
+                    cudaStreamEndCapture(activeStream, &spmvGraph);
+                    return fail("cusparseSpMV (capture)");
+                }
+                if (cudaStreamEndCapture(activeStream, &spmvGraph) != cudaSuccess)
+                {
+                    return fail("cudaStreamEndCapture");
+                }
+                if (cudaGraphInstantiate(&spmvGraphExec, spmvGraph, nullptr, nullptr, 0) != cudaSuccess)
+                {
+                    return fail("cudaGraphInstantiate");
+                }
+                spmvGraphReady = true;
+                if (cudaGraphLaunch(spmvGraphExec, activeStream) != cudaSuccess)
+                {
+                    return fail("cudaGraphLaunch");
+                }
+                launchedFromGraph = true;
+            }
+            else if (spmvGraphReady)
+            {
+                cudaStream_t launchStream = computeStream ? computeStream : nullptr;
+                if (cudaGraphLaunch(spmvGraphExec, launchStream) != cudaSuccess)
+                {
+                    return fail("cudaGraphLaunch");
+                }
+                launchedFromGraph = true;
+            }
+        }
+
+        if (!launchedFromGraph)
+        {
+            if
+            (
+                cusparseSpMV
+                (
+                    cusparseHandle,
+                    CUSPARSE_OPERATION_NON_TRANSPOSE,
+                    &alpha,
+                    matA,
+                    vecX,
+                    &zero,
+                    vecY,
+                    CUDA_R_64F,
+                    CUSPARSE_SPMV_ALG_DEFAULT,
+                    spmvBuffer
+                ) != CUSPARSE_STATUS_SUCCESS
+            )
+            {
+                return fail("cusparseSpMV (A*p)");
+            }
+        }
+
+        if (!syncStream())
+        {
+            return false;
         }
 
         // Restore vecX to x for completeness
@@ -1049,6 +2233,10 @@ bool Foam::cudaPCG::gpuSolve
         {
             cleanup();
             return fail("cublas dot(p,Ap)");
+        }
+        if (!syncStream())
+        {
+            return false;
         }
         scalar pAp = returnReduce(static_cast<scalar>(pApDevice), sumOp<scalar>());
 
@@ -1071,12 +2259,22 @@ bool Foam::cudaPCG::gpuSolve
             cleanup();
             return fail("cublas dasum(r iter)");
         }
+        if (!syncStream())
+        {
+            return false;
+        }
         sumAbs = returnReduce(static_cast<scalar>(sumAbsDevice), sumOp<scalar>());
 
         solverPerf.finalResidual() = sumAbs/normFactor;
 
         ++iter;
         solverPerf.nIterations() = iter;
+
+        if (logResidualTrajectory && (iter % residualLogEvery == 0))
+        {
+            residualIterHistory.push_back(iter);
+            residualValueHistory.push_back(solverPerf.finalResidual());
+        }
 
         if
         (
@@ -1096,6 +2294,10 @@ bool Foam::cudaPCG::gpuSolve
             cleanup();
             return fail("cublas dot(r,z) iter");
         }
+        if (!syncStream())
+        {
+            return false;
+        }
 
         const scalar rzOld = rz;
         rz = returnReduce(static_cast<scalar>(rzNewDevice), sumOp<scalar>());
@@ -1103,14 +2305,50 @@ bool Foam::cudaPCG::gpuSolve
         const scalar betaStep = rzOld != 0 ? rz/rzOld : 0;
         const double betaDevice = static_cast<double>(betaStep);
 
-        if (cublasDscal(cublasHandle, rows, &betaDevice, reinterpret_cast<double*>(d_p), 1) != CUBLAS_STATUS_SUCCESS)
-            return fail("cublas scal p*=beta");
-        if (cublasDaxpy(cublasHandle, rows, reinterpret_cast<const double*>(&alpha), reinterpret_cast<const double*>(d_z), 1, reinterpret_cast<double*>(d_p), 1) != CUBLAS_STATUS_SUCCESS)
-            return fail("cublas axpy p+=z");
+        if (usePipelinedCG)
+        {
+            if (cublasDscal(cublasHandle, rows, &betaDevice, reinterpret_cast<double*>(d_p), 1) != CUBLAS_STATUS_SUCCESS)
+            {
+                return fail("cublas scal p*=beta");
+            }
+            const double minusAlphaBetaDevice = -alphaDevice * betaDevice;
+            if (cublasDaxpy(cublasHandle, rows, &minusAlphaBetaDevice, reinterpret_cast<const double*>(d_Ap), 1, reinterpret_cast<double*>(d_p), 1) != CUBLAS_STATUS_SUCCESS)
+            {
+                return fail("cublas axpy p-=alphaBetaAp");
+            }
+            if (cublasDaxpy(cublasHandle, rows, reinterpret_cast<const double*>(&alpha), reinterpret_cast<const double*>(d_z), 1, reinterpret_cast<double*>(d_p), 1) != CUBLAS_STATUS_SUCCESS)
+            {
+                return fail("cublas axpy p+=z");
+            }
+        }
+        else
+        {
+            if (cublasDscal(cublasHandle, rows, &betaDevice, reinterpret_cast<double*>(d_p), 1) != CUBLAS_STATUS_SUCCESS)
+            {
+                return fail("cublas scal p*=beta");
+            }
+            if (cublasDaxpy(cublasHandle, rows, reinterpret_cast<const double*>(&alpha), reinterpret_cast<const double*>(d_z), 1, reinterpret_cast<double*>(d_p), 1) != CUBLAS_STATUS_SUCCESS)
+            {
+                return fail("cublas axpy p+=z");
+            }
+        }
     }
 
     cudaMemcpy(psi.begin(), d_x, sizeof(DeviceScalar)*rows, cudaMemcpyDeviceToHost);
     cleanup();
+    if (logResidualTrajectory)
+    {
+        const label lastRecordedIter =
+            residualIterHistory.empty()
+          ? -1
+          : residualIterHistory.back();
+        if (solverPerf.nIterations() > lastRecordedIter)
+        {
+            residualIterHistory.push_back(solverPerf.nIterations());
+            residualValueHistory.push_back(solverPerf.finalResidual());
+        }
+    }
+    writeTelemetry(true, word::null);
     return true;
 }
 

@@ -49,12 +49,13 @@
 - Safety rails: if a GPU trial exceeds 10 minutes, diverges, or fails the parity gate, revert to the safe path (diagonal preconditioner, CPU fallback) and iterate.
 
 **PLAN (current execution order)**
-1. Add a coloured GPU preconditioner:
-   - Build colour sets from the pressure matrix addressing and launch per-colour forward/back sweeps with damping.
-   - Auto-fallback to the diagonal preconditioner if divergence or instability is detected.
+1. Stabilise and benchmark the coloured GPU preconditioner:
+   - **Status:** pitzDaily sweep complete (`run/logs/pitzDaily_gpu_colour_scan2_20251012-150314/summary.csv`). All runs stayed on the colour path (`disableCount=0`).
+   - Recommended defaults baked into `cudaPCG`: `colourOmega=0.65`, `colourBackwardOmega=0.85`, `colourDiagFloor=1e-12` (details in `docs/gpu-colour-preconditioner-20251012.md`).
+   - Telemetry/logging (`logResidualTrajectory`, `logColourStats`) and sweep script (`bin/gpu_colour_sweep.sh`) ready for future validation cases.
 2. Reduce CG iteration overhead:
-   - Implement a pipelined CG variant that fuses dot products/reductions.
-   - Capture the steady-state kernel sequence in a CUDA Graph to trim launch latency (retain the legacy path as a runtime switch).
+   - **Status:** pipelined search-direction update (`usePipelinedCG`) landed; steady-state `cusparseSpMV` replay captured via CUDA Graph when `useCudaGraph` is true (`cudaGraphWarmup` configurable).
+   - Pipelined smoke log: `run/logs/pitzDaily_gpu_colour_pipelined_smoke_20251012-183303/summary.csv` (rel L2(Ux)≈3.3e-5, 785 iterations, ExecutionTime ≈245 s). Leave toggle opt-in until tuning recovers parity/run-time.
 3. Keep the full PIMPLE loop on the GPU:
    - Extend `pimpleFoamGPU` so ddt/div/laplacian kernels, turbulence `correct()`, and Courant calculations operate on device-resident fields.
    - Copy results back only at write times; CPU path remains untouched.

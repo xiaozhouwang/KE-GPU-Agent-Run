@@ -25,8 +25,26 @@ struct CsrMatrix
     scalarField values; // size nnz
 };
 
+struct Colouring
+{
+    //- Number of colours produced by the greedy colouring
+    label nColours;
+
+    //- Colour index per cell/row (size nRows)
+    labelList cellToColour;
+
+    //- Offsets into colourIndices for each colour (size nColours+1)
+    labelList colourPtr;
+
+    //- Row indices grouped by colour
+    labelList colourIndices;
+};
+
 // Build a full symmetric CSR (diagonal + both off-diagonal entries)
 CsrMatrix buildSymmetricCsr(const lduMatrix& A);
+
+// Greedy graph colouring for the cell adjacency implied by the matrix
+Colouring buildGreedyColouring(const lduMatrix& A);
 
 } // namespace cudaPCGDetail
 } // namespace Foam

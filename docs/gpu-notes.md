@@ -17,4 +17,33 @@
 2. Keep field data on the GPU throughout the PIMPLE loop (remove remaining host copies).
 3. Move discretisation kernels into the `_gpu` tree outlined in `~/Downloads/acc_plan.md`.
 
+## Coloured preconditioner status (2025-10-12)
+- NVRTC compilation fixed; colour kernels now build at runtime and stay active (telemetry and residual logs confirmed zero CPU fallback across the pitzDaily sweep).
+- New telemetry:
+  - `logResidualTrajectory`, `residualLogEvery`, `residualLogFile`
+  - `logColourStats`, `colourStatsFile`
+  - Automatically logs disable reasons, min/max/avg colour-set sizes, and writes CSVs under `postProcessing/cudaPCG/`.
+- Sweep driver: `bin/gpu_colour_sweep.sh`
+  - Produces parameterised runs, captures `compare_latest_U.sh` parity, and writes `summary.csv` + per-case artefacts under `run/logs/<prefix>_<timestamp>/`.
+  - Latest full sweep (27 combos, pitzDaily) lives at `run/logs/pitzDaily_gpu_colour_scan2_20251012-150314/`.
+- Recommended defaults (now baked into `cudaPCG`):
+  - `colourOmega = 0.65`, `colourBackwardOmega = 0.85`, `colourDiagFloor = 1e-12`.
+  - Combination chosen from sweep for lowest relative L2(Ux) (~1.36e-5) with stable residual decay to ~1e-7.
+- When benchmarking, enable telemetry in `system/fvSolution` to capture artefacts, e.g.:
+  ```foam
+  reportGpuStats        true;
+  logColourStats        true;
+  logResidualTrajectory true;
+  residualLogEvery      1;
+  residualLogFile       "postProcessing/cudaPCG/residual.csv";
+  colourStatsFile       "postProcessing/cudaPCG/colour_stats.csv";
+  ```
+
+## Pipelined CG & CUDA Graph (2025-10-12)
+- Runtime switches added to the solver dictionary:
+  - `usePipelinedCG` toggles the Chronopoulos–Gear style update (`p = z + β(p - αAp)`), reducing redundant vector operations per iteration.
+  - `useCudaGraph` plus optional `cudaGraphWarmup` records the steady-state `cusparseSpMV` into a CUDA Graph after the warm-up stage and replays it on subsequent iterations via a dedicated non-blocking stream.
+- `bin/gpu_colour_sweep.sh` now records PCG iteration counts, final residuals, and Execution/Clock time for each case. Artefacts for the pipelined smoke test sit under `run/logs/pitzDaily_gpu_colour_pipelined_smoke_20251012-183303/`.
+- Observation: on pitzDaily the pipelined+graph path increases parity drift slightly (rel L2(Ux)≈3.3e-5 vs 1.36e-5) and is slower (~245 s vs 235 s). Keep it behind the runtime flag until further tuning, but the infrastructure is in place for Step 2 experiments.
+
 These changes keep the CPU code untouched and establish the parallel `_gpu` scaffolding described in the acceleration plan.

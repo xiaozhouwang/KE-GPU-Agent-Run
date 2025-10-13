@@ -2,6 +2,7 @@
 #include "error.H"
 
 #include <string>
+#include <sstream>
 
 #ifdef FOAM_USE_CUDA
     #include <cuda.h>
@@ -83,8 +84,15 @@ void surfaceSubtract(double* dst, const double* a, const double* b, int n)
         return false;
     }
 
-    const char* options[] = { "--std=c++14" };
-    nvStatus = nvrtcCompileProgram(prog, 1, options);
+    int deviceId = 0;
+    cudaGetDevice(&deviceId);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, deviceId);
+    std::ostringstream arch;
+    arch<< "--gpu-architecture=compute_" << prop.major << prop.minor;
+    const std::string archStr = arch.str();
+    const char* options[] = { "--std=c++14", archStr.c_str() };
+    nvStatus = nvrtcCompileProgram(prog, 2, options);
 
     if (nvStatus != NVRTC_SUCCESS)
     {
@@ -313,8 +321,15 @@ void velocityCorrector(double* u, const double* h, const double* grad, const dou
         return false;
     }
 
-    const char* options[] = { "--std=c++14" };
-    nvStatus = nvrtcCompileProgram(prog, 1, options);
+    int deviceId = 0;
+    cudaGetDevice(&deviceId);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, deviceId);
+    std::ostringstream arch;
+    arch<< "--gpu-architecture=compute_" << prop.major << prop.minor;
+    const std::string archStr = arch.str();
+    const char* options[] = { "--std=c++14", archStr.c_str() };
+    nvStatus = nvrtcCompileProgram(prog, 2, options);
 
     if (nvStatus != NVRTC_SUCCESS)
     {

@@ -63,4 +63,5 @@ This doc will track deviations and updates as the GPU PIMPLE loop matures.
 - Smoke test: run `pimpleFoamGPU` on `pitzDaily` twice (with and without `useGpuFieldOps`) and diff the final `phi`.
 - Automated harness: `run/scripts/run_gpu_parity.sh` performs the twin runs and reports mismatches (diff on `phi` & `U`).
 - Performance sweep: `run/scripts/benchmark_gpu_speed.sh` rebuilds baseline CPU/GPU cases and prints wall-clock and computed speedup.
+- Timing CSVs: enabling `PIMPLE.logGpuFieldOps` now records per-kernel milliseconds under `postProcessing/gpuFieldOps/<time>/stats.csv`.
 - Once more kernels land, extend the existing `run/scripts/run_gpu_trial.sh` harness to pass `useGpuFieldOps true` via an overlay `fvSolution` dictionary and compare against the CPU reference (`relative L2(Ux) ≤ 1e-2` gate).

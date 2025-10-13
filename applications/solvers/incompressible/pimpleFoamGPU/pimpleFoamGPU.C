@@ -29,8 +29,18 @@ Description
 #include "DeviceField.H"
 #include "GpuContext.H"
 #include "FieldOps.H"
+#include "DynamicList.H"
+#include "OFstream.H"
+#include "OSspecific.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+struct GpuOpRecord
+{
+    Foam::word timeName;
+    Foam::word operation;
+    Foam::scalar milliseconds;
+};
 
 namespace
 {
@@ -106,6 +116,8 @@ int main(int argc, char *argv[])
         pimple.dict().lookupOrDefault<Switch>("logGpuFieldOps", false)
     );
 
+    DynamicList<GpuOpRecord> gpuOpStats;
+
     turbulence->validate();
 
     if (!LTS)
@@ -118,6 +130,7 @@ int main(int argc, char *argv[])
 
     while (pimple.run(runTime))
     {
+        gpuOpStats.clear();
         #include "readDyMControls.H"
 
         if (LTS)
@@ -172,6 +185,19 @@ int main(int argc, char *argv[])
                 viscosity->correct();
                 turbulence->correct();
             }
+        }
+
+        if (logGpuFieldOps && gpuOpStats.size())
+        {
+            const fileName logDir = runTime.path()/"postProcessing"/"gpuFieldOps"/runTime.timeName();
+            mkDir(logDir);
+            OFstream os(logDir/"stats.csv");
+            os<< "operation,milliseconds" << '\n';
+            for (const GpuOpRecord& rec : gpuOpStats)
+            {
+                os<< rec.operation << ',' << rec.milliseconds << '\n';
+            }
+            gpuOpStats.clear();
         }
 
         runTime.write();

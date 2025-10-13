@@ -49,18 +49,19 @@
 - Safety rails: if a GPU trial exceeds 10 minutes, diverges, or fails the parity gate, revert to the safe path (diagonal preconditioner, CPU fallback) and iterate.
 
 **PLAN (current execution order)**
-1. Stabilise and benchmark the coloured GPU preconditioner:
-   - **Status:** pitzDaily sweep complete (`run/logs/pitzDaily_gpu_colour_scan2_20251012-150314/summary.csv`). All runs stayed on the colour path (`disableCount=0`).
-   - Recommended defaults baked into `cudaPCG`: `colourOmega=0.65`, `colourBackwardOmega=0.85`, `colourDiagFloor=1e-12` (details in `docs/gpu-colour-preconditioner-20251012.md`).
-   - Telemetry/logging (`logResidualTrajectory`, `logColourStats`) and sweep script (`bin/gpu_colour_sweep.sh`) ready for future validation cases.
-2. Reduce CG iteration overhead (infrastructure ready):
-   - Pipelined direction update (`usePipelinedCG`), CUDA Graph replay (`useCudaGraph`), and iteration timing (`logIterationStats`) are available. Grid sweep (`run/logs/pitzDaily_gpu_colour_grid_small_*`) indicates ω_fwd≈0.65, ω_back≈0.80 is a good compromise (~77 iterations, rel L2≈3.2e-5, ExecutionTime ≈231 s). Further heuristics deferred until the full GPU loop is in place.
-3. Full GPU PIMPLE loop (next focus):
-   - Keep volume fields resident on device; port ddt/div/laplacian kernels, turbulence `correct()`, and Courant/time-step logic into CUDA.
-   - Only copy data back at write times; CPU path remains untouched when GPU is disabled.
-4. End-to-end validation & regression guards:
-   - Extend sweep scripts to capture wall-clock and enforce parity/iteration/time thresholds (via `bin/check_colour_summary.py`).
-   - Benchmark pitzDaily (and a secondary case) to drive the GPU loop below the 35 s CPU baseline while keeping relative L2(Ux) ≤ 1e-2.
+1. **GPU finite-volume operators**
+   - Port `fvm::ddt`, `fvm::div(phi,U)`, and `fvm::laplacian(rAtU(),p)` to dedicated CUDA kernels that operate on the existing device-resident field wrappers.
+   - Mirror boundary-condition handling from the CPU path; ensure the kernels accept runtime-selected discretisation schemes.
+   - Integrate the kernels into `pimpleFoamGPU`, keeping the CPU implementation intact behind `useGpuFieldOps=false`.
+2. **Turbulence and source-term GPU path**
+   - Implement a CUDA-backed turbulence `correct()` (RAS initially) and any dependent algebra so turbulence fields remain on-device.
+   - Audit additional source terms (fvModels/fvConstraints) and provide GPU fallbacks or staged host/device copies as needed.
+3. **Kernel orchestration & caching**
+   - Extend the GPU infrastructure to cache NVRTC output per compute capability, batch small vector ops via CUDA Graphs, and introduce multi-stream execution where overlap with host IO is possible.
+   - Add SoA-friendly accessors or layouts for vector fields if profiling shows strided loads as a bottleneck.
+4. **Profiling, validation, and regression**
+   - Expand the timing CSV exports to include every new kernel; feed the data into the benchmark script for automated speed reports.
+   - Maintain `run/scripts/run_gpu_parity.sh` as the correctness gate and push `run/scripts/benchmark_gpu_speed.sh` below the ~35 s CPU baseline on pitzDaily before considering deployment.
 
 
 ---

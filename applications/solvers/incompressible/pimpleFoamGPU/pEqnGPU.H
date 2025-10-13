@@ -56,25 +56,31 @@ while (pimple.correctNonOrthogonal())
         surfaceScalarField phiFlux(pEqn.flux());
 
         bool gpuUpdatedPhi = false;
-        Foam::gpu::DeviceField<surfaceScalarField>* phiDevPtr = nullptr;
+        Foam::gpu::DeviceField<surfaceScalarField>& phiDev =
+            gpuRegistry.getOrCreate(phi);
 
         if (useGpuFieldOps && gpuContext.ready())
         {
             word gpuError;
             Foam::gpu::OperationStats phiStats;
 
-            phiDevPtr = &gpuRegistry.getOrCreate(phi);
-            Foam::gpu::DeviceField<surfaceScalarField> phiHbyADev(phiHbyA);
-            Foam::gpu::DeviceField<surfaceScalarField> fluxDev(phiFlux);
+            Foam::gpu::DeviceField<surfaceScalarField>& phiHbyADev =
+                gpuRegistry.getOrCreate(phiHbyA);
+            Foam::gpu::DeviceField<surfaceScalarField>& fluxDev =
+                gpuRegistry.getOrCreate(phiFlux);
+
+            phiDev.markHostDirty();
+            phiHbyADev.markHostDirty();
+            fluxDev.markHostDirty();
 
             bool ok =
-                phiDevPtr->syncHostToDevice(gpuContext, gpuError)
+                phiDev.syncHostToDevice(gpuContext, gpuError)
              && phiHbyADev.syncHostToDevice(gpuContext, gpuError)
              && fluxDev.syncHostToDevice(gpuContext, gpuError)
              && subtractSurfaceScalarFields
                 (
                     gpuContext,
-                    *phiDevPtr,
+                    phiDev,
                     phiHbyADev,
                     fluxDev,
                     gpuError,
@@ -83,8 +89,8 @@ while (pimple.correctNonOrthogonal())
 
             if (ok)
             {
-                phiDevPtr->markDeviceDirty();
-                ok = phiDevPtr->syncDeviceToHost(gpuContext, gpuError);
+                phiDev.markDeviceDirty();
+                ok = phiDev.syncDeviceToHost(gpuContext, gpuError);
             }
 
             if (ok)
@@ -92,8 +98,14 @@ while (pimple.correctNonOrthogonal())
                 gpuUpdatedPhi = true;
                 if (logGpuFieldOps)
                 {
-                    Info<< "cuda phi update: " << phiStats.gpuMilliseconds
-                        << " ms" << nl;
+                    gpuOpStats.append
+                    (
+                        {
+                            runTime.timeName(),
+                            word("phiCorrector"),
+                            phiStats.gpuMilliseconds
+                        }
+                    );
                 }
             }
             else if (!gpuError.empty())
@@ -106,10 +118,17 @@ while (pimple.correctNonOrthogonal())
         if (!gpuUpdatedPhi)
         {
             phi = phiHbyA - phiFlux;
-
-            if (phiDevPtr)
+            phiDev.markHostDirty();
+            if (logGpuFieldOps)
             {
-                phiDevPtr->markHostDirty();
+                gpuOpStats.append
+                (
+                    {
+                        runTime.timeName(),
+                        word("phiCorrector_cpu"),
+                        Foam::scalar(-1)
+                    }
+                );
             }
         }
     }
@@ -124,27 +143,34 @@ tmp<volVectorField> gradPTmp(fvc::grad(p));
 volVectorField& gradP = gradPTmp.ref();
 
 bool gpuUpdatedU = false;
-Foam::gpu::DeviceField<volVectorField>* uDevPtr = nullptr;
+Foam::gpu::DeviceField<volVectorField>& uDev = gpuRegistry.getOrCreate(U);
 
 if (useGpuFieldOps && gpuContext.ready())
 {
     word gpuError;
     Foam::gpu::OperationStats uStats;
 
-    uDevPtr = &gpuRegistry.getOrCreate(U);
-    Foam::gpu::DeviceField<volVectorField> hbyADev(HbyA);
-    Foam::gpu::DeviceField<volScalarField> rAtUDev(rAtUField);
-    Foam::gpu::DeviceField<volVectorField> gradPDev(gradP);
+    Foam::gpu::DeviceField<volVectorField>& hbyADev =
+        gpuRegistry.getOrCreate(HbyA);
+    Foam::gpu::DeviceField<volScalarField>& rAtUDev =
+        gpuRegistry.getOrCreate(rAtUField);
+    Foam::gpu::DeviceField<volVectorField>& gradPDev =
+        gpuRegistry.getOrCreate(gradP);
+
+    uDev.markHostDirty();
+    hbyADev.markHostDirty();
+    rAtUDev.markHostDirty();
+    gradPDev.markHostDirty();
 
     bool ok =
-        uDevPtr->syncHostToDevice(gpuContext, gpuError)
+        uDev.syncHostToDevice(gpuContext, gpuError)
      && hbyADev.syncHostToDevice(gpuContext, gpuError)
      && rAtUDev.syncHostToDevice(gpuContext, gpuError)
      && gradPDev.syncHostToDevice(gpuContext, gpuError)
      && velocityCorrector
         (
             gpuContext,
-            *uDevPtr,
+            uDev,
             hbyADev,
             rAtUDev,
             gradPDev,
@@ -154,8 +180,8 @@ if (useGpuFieldOps && gpuContext.ready())
 
     if (ok)
     {
-        uDevPtr->markDeviceDirty();
-        ok = uDevPtr->syncDeviceToHost(gpuContext, gpuError);
+        uDev.markDeviceDirty();
+        ok = uDev.syncDeviceToHost(gpuContext, gpuError);
     }
 
     if (ok)
@@ -163,7 +189,14 @@ if (useGpuFieldOps && gpuContext.ready())
         gpuUpdatedU = true;
         if (logGpuFieldOps)
         {
-            Info<< "cuda U update: " << uStats.gpuMilliseconds << " ms" << nl;
+            gpuOpStats.append
+            (
+                {
+                    runTime.timeName(),
+                    word("velocityCorrector"),
+                    uStats.gpuMilliseconds
+                }
+            );
         }
     }
     else if (!gpuError.empty())
@@ -176,10 +209,17 @@ if (useGpuFieldOps && gpuContext.ready())
 if (!gpuUpdatedU)
 {
     U = HbyA - rAtUField*gradP;
-
-    if (uDevPtr)
+    uDev.markHostDirty();
+    if (logGpuFieldOps)
     {
-        uDevPtr->markHostDirty();
+        gpuOpStats.append
+        (
+            {
+                runTime.timeName(),
+                    word("velocityCorrector_cpu"),
+                    Foam::scalar(-1)
+            }
+        );
     }
 }
 

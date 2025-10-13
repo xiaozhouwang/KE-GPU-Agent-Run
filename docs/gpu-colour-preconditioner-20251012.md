@@ -57,3 +57,33 @@ These values are now the compilation-time defaults inside `cudaPCG` (overridable
 | 0.85  | 0.85   | 2.62 | 100.0 | 3.97  | 219.951 |
 
 Final residuals are scaled to 1e⁻⁶ for readability; execution times come from the tail `ExecutionTime` line in each `log.pimpleFoam`. The relative ranking mirrors the steady case, lending confidence to the selected defaults.
+
+## Targeted low-iteration sweep (2025-10-12 evening)
+
+- Artefacts: `run/logs/pitzDaily_gpu_colour_grid_small_*` (16 runs, single floor `1e-12`).
+- Goal: find `(colourOmega, colourBackwardOmega)` pairs that minimise PCG iterations while keeping rel L2(Ux) ≤ ~4e-5.
+- Observations:
+  * Lowering ω_fwd below 0.55 is risky (parity drifts, execution time unaffected).
+  * ω_fwd=0.65, ω_back=0.80 yields ~77 iterations and the best runtime so far (~231 s) with rel L2≈3.2e-5.
+  * Extreme back-relaxation (ω_back=0.85) still gives the best parity but pushes iterations toward the 800 range.
+
+| ω_fwd | ω_back | iterations | ExecTime [s] | relL2(Ux) |
+|------:|-------:|-----------:|-------------:|-----------:|
+| 0.50 | 0.85 | 66 | 247.60 | 2.22e-05 |
+| 0.55 | 0.70 | 67 | 236.16 | 3.12e-05 |
+| 0.65 | 0.80 | 77 | 230.72 | 3.20e-05 |
+| 0.50 | 0.75 | 84 | 249.60 | 4.40e-05 |
+| 0.55 | 0.75 | 87 | 236.79 | 3.31e-05 |
+| 0.60 | 0.85 | 116 | 238.32 | 3.80e-05 |
+| 0.65 | 0.75 | 176 | 235.50 | 2.07e-05 |
+| 0.65 | 0.70 | 186 | 235.42 | 2.26e-05 |
+| 0.60 | 0.80 | 252 | 242.19 | 3.24e-05 |
+| 0.50 | 0.70 | 721 | 245.93 | 2.75e-05 |
+| 0.60 | 0.70 | 767 | 236.29 | 1.44e-05 |
+| 0.55 | 0.80 | 773 | 234.98 | 2.78e-05 |
+| 0.65 | 0.85 | 782 | 235.14 | 1.36e-05 |
+| 0.60 | 0.75 | 790 | 237.53 | 8.14e-06 |
+| 0.50 | 0.80 | 817 | 245.75 | 1.39e-05 |
+| 0.55 | 0.85 | 829 | 245.46 | 1.05e-05 |
+
+Takeaway: ω_fwd≈0.65 with ω_back≈0.80 is a promising compromise (iterations ≈77, rel L2≈3.2e-5, ExecTime ≈231 s). Further tuning should focus on nudging ω_fwd between 0.6–0.65 and ω_back 0.78–0.82, possibly with adaptive diagonal floors, to recover the 116 s baseline while keeping parity intact.

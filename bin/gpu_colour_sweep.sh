@@ -19,6 +19,11 @@ Options:
   --pipelined           Enable pipelined CG path (sets usePipelinedCG true)
   --cuda-graph          Enable CUDA Graph replay (sets useCudaGraph true)
   --graph-warmup N      Iterations before capturing CUDA Graph (default: 5)
+  --log-iter            Enable solver-side iteration timing (`logIterationStats true`)
+  --summary-check       Run regression checks on the produced summary
+  --max-rel VALUE       Max allowed relL2(Ux) when --summary-check is used (default: 1e-2)
+  --max-iter VALUE      Max allowed PCG iterations when --summary-check is used (default: 1000)
+  --max-time VALUE      Max allowed ExecutionTime [s] when --summary-check is used (default: 300)
   --help                Show this message
 EOF
 }
@@ -84,6 +89,11 @@ threshold=1e-2
 enable_pipelined=false
 enable_cuda_graph=false
 graph_warmup=5
+enable_iter_logging=false
+enable_summary_check=false
+check_rel=1e-2
+check_iter=1000
+check_time=300
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -99,6 +109,11 @@ while [[ $# -gt 0 ]]; do
         --pipelined) enable_pipelined=true; shift ;;
         --cuda-graph) enable_cuda_graph=true; shift ;;
         --graph-warmup) graph_warmup="$2"; shift 2;;
+        --log-iter) enable_iter_logging=true; shift ;;
+        --summary-check) enable_summary_check=true; shift ;;
+        --max-rel) check_rel="$2"; shift 2;;
+        --max-iter) check_iter="$2"; shift 2;;
+        --max-time) check_time="$2"; shift 2;;
         --help|-h) usage; exit 0;;
         *) echo "Unknown option: $1" >&2; usage; exit 2;;
     esac
@@ -186,6 +201,9 @@ for omega in "${omegas[@]}"; do
             if [[ "$enable_cuda_graph" == true ]]; then
                 foam_dict_set "$dict" "solvers/p/useCudaGraph" "true"
                 foam_dict_set "$dict" "solvers/p/cudaGraphWarmup" "$graph_warmup"
+            fi
+            if [[ "$enable_iter_logging" == true ]]; then
+                foam_dict_set "$dict" "solvers/p/logIterationStats" "true"
             fi
 
             foam_dict_set "$dict" "solvers/pFinal/colourOmega" "$omega"
@@ -304,3 +322,11 @@ PY
 done
 
 echo "Sweep complete. Summary: $summary"
+
+if [[ "$enable_summary_check" == true ]]; then
+    python3 "$(dirname "$0")/check_colour_summary.py" \
+        --file "$summary" \
+        --max-rel "$check_rel" \
+        --max-iter "$check_iter" \
+        --max-time "$check_time"
+fi

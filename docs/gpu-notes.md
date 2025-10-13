@@ -45,5 +45,6 @@
   - `useCudaGraph` plus optional `cudaGraphWarmup` records the steady-state `cusparseSpMV` into a CUDA Graph after the warm-up stage and replays it on subsequent iterations via a dedicated non-blocking stream.
 - `bin/gpu_colour_sweep.sh` now records PCG iteration counts, final residuals, and Execution/Clock time for each case. Artefacts for the pipelined smoke test sit under `run/logs/pitzDaily_gpu_colour_pipelined_smoke_20251012-183303/`.
 - Observation: on pitzDaily the pipelined+graph path increases parity drift slightly (rel L2(Ux)≈3.3e-5 vs 1.36e-5) and is slower (~245 s vs 235 s). Keep it behind the runtime flag until further tuning, but the infrastructure is in place for Step 2 experiments.
+- A targeted grid sweep (`scripts/run_colour_grid.py`, results under `run/logs/pitzDaily_gpu_colour_grid_small_*`) shows `(colourOmega≈0.65, colourBackwardOmega≈0.80)` drops PCG iterations to ~77 with rel L2≈3.2e-5 and ExecutionTime ≈231 s. Candidate for follow-up heuristics.
 
 These changes keep the CPU code untouched and establish the parallel `_gpu` scaffolding described in the acceleration plan.

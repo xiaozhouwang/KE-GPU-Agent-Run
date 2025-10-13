@@ -18,6 +18,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <chrono>
 
 #ifdef FOAM_USE_CUDA
 #include <cuda_runtime.h>
@@ -586,6 +587,10 @@ bool Foam::cudaPCG::gpuSolve
     const label cudaGraphWarmup =
         std::max<label>(0, controlDict_.lookupOrDefault<label>("cudaGraphWarmup", 5));
 
+    const Switch iterStatsSwitch =
+        controlDict_.lookupOrDefault<Switch>("logIterationStats", Switch(false));
+    const bool logIterationStats = bool(iterStatsSwitch);
+
     const label residualLogEvery =
         std::max<label>(1, controlDict_.lookupOrDefault<label>("residualLogEvery", 1));
 
@@ -636,6 +641,11 @@ bool Foam::cudaPCG::gpuSolve
     cudaGraphExec_t spmvGraphExec = nullptr;
     bool spmvGraphReady = false;
 
+    double setupTimeSeconds = 0.0;
+    double iterationAccumSeconds = 0.0;
+    double iterationMaxSeconds = 0.0;
+    label iterationCountStats = 0;
+
     cudaError_t cudaCode = cudaSetDevice(deviceId);
     if (cudaCode != cudaSuccess)
     {
@@ -652,7 +662,7 @@ bool Foam::cudaPCG::gpuSolve
 
     static_assert(sizeof(scalar) == sizeof(double), "cudaPCG currently requires double precision build");
 
-    using DeviceScalar = double;
+using DeviceScalar = double;
 
     const int rows = static_cast<int>(csrMatrix.nRows);
     const int nnz = static_cast<int>(csrMatrix.nnz);
@@ -2033,6 +2043,12 @@ bool Foam::cudaPCG::gpuSolve
     }
 
     // r = b - A*x
+    std::chrono::steady_clock::time_point setupStart;
+    if (logIterationStats)
+    {
+        setupStart = std::chrono::steady_clock::now();
+    }
+
     if
     (
         cusparseSpMV
@@ -2055,6 +2071,10 @@ bool Foam::cudaPCG::gpuSolve
     if (!syncStream())
     {
         return false;
+    }
+    if (logIterationStats)
+    {
+        setupTimeSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - setupStart).count();
     }
 
     if (cublasDcopy(cublasHandle, rows, reinterpret_cast<const double*>(d_b), 1, reinterpret_cast<double*>(d_r), 1) != CUBLAS_STATUS_SUCCESS)
@@ -2132,6 +2152,11 @@ bool Foam::cudaPCG::gpuSolve
      || iter < minIter_
     )
     {
+        std::chrono::steady_clock::time_point iterStart;
+        if (logIterationStats)
+        {
+            iterStart = std::chrono::steady_clock::now();
+        }
         if (cusparseDnVecSetValues(vecX, d_p) != CUSPARSE_STATUS_SUCCESS)
         {
             return fail("cusparseSetVec(p)");
@@ -2332,6 +2357,17 @@ bool Foam::cudaPCG::gpuSolve
                 return fail("cublas axpy p+=z");
             }
         }
+
+        if (logIterationStats)
+        {
+            const double iterSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - iterStart).count();
+            iterationAccumSeconds += iterSeconds;
+            if (iterSeconds > iterationMaxSeconds)
+            {
+                iterationMaxSeconds = iterSeconds;
+            }
+            ++iterationCountStats;
+        }
     }
 
     cudaMemcpy(psi.begin(), d_x, sizeof(DeviceScalar)*rows, cudaMemcpyDeviceToHost);
@@ -2349,6 +2385,14 @@ bool Foam::cudaPCG::gpuSolve
         }
     }
     writeTelemetry(true, word::null);
+    if (logIterationStats && Pstream::master())
+    {
+        double avgIterSeconds = iterationCountStats > 0 ? iterationAccumSeconds/static_cast<double>(iterationCountStats) : 0.0;
+        Info<< "cudaPCG(" << fieldName_ << "): timing setup=" << setupTimeSeconds
+            << " s, iterations=" << iterationCountStats
+            << ", avgIter=" << avgIterSeconds << " s"
+            << ", maxIter=" << iterationMaxSeconds << " s" << nl;
+    }
     return true;
 }
 

@@ -808,6 +808,7 @@ using DeviceScalar = double;
     bool useSGS = false;
     bool useILU = false;
     bool useIC = false;
+    bool useComposite = false;
 
     if
     (
@@ -818,6 +819,8 @@ using DeviceScalar = double;
      || precondLower == "multicolor"
      || precondLower == "colorgs"
      || precondLower == "colourgs"
+     || precondLower.find("colour+ic") != std::string::npos
+     || precondLower.find("color+ic") != std::string::npos
     )
     {
         useColour = true;
@@ -830,10 +833,14 @@ using DeviceScalar = double;
     {
         useILU = true;
     }
-    else if (precondLower == "ic0" || precondLower == "ic" || precondLower == "dic")
+    else if (precondLower == "ic0" || precondLower == "ic" || precondLower == "dic" || precondLower.find("+ic") != std::string::npos)
     {
         // Map DIC to IC0 on GPU for closer parity with CPU
         useIC = true;
+    }
+    if (precondLower == "composite" || precondLower.find("colour+ic") != std::string::npos || precondLower.find("color+ic") != std::string::npos)
+    {
+        useComposite = true;
     }
 
     colourInitiallyRequested = useColour;
@@ -1612,11 +1619,46 @@ using DeviceScalar = double;
     if (useILU || useIC)
     {
         // Allocate separate values array for in-place factorization
+        // Start from host values and apply diagonal regularisation specifically for ILU/IC
+        List<DeviceScalar> iluValsHost(nnz);
+        for (int i = 0; i < nnz; ++i) iluValsHost[i] = values[i];
+
+        const scalar iluDiagAbsFloorCfg = controlDict_.lookupOrDefault<scalar>("iluDiagAbsFloor", diagFloorCfg);
+        const scalar iluDiagRelFloorCfg = controlDict_.lookupOrDefault<scalar>("iluDiagRelFloor", scalar(0));
+        const double iluDiagFloorEff = std::max(static_cast<double>(iluDiagAbsFloorCfg), static_cast<double>(iluDiagRelFloorCfg)*static_cast<double>(maxAbsDiag));
+
+        if (useIC || useILU)
+        {
+            for (int i = 0; i < rows; ++i)
+            {
+                int diagK = -1;
+                for (int k = rowPtr[i]; k < rowPtr[i+1]; ++k)
+                {
+                    if (colInd[k] == i) { diagK = k; break; }
+                }
+                if (diagK >= 0)
+                {
+                    double dv = static_cast<double>(iluValsHost[diagK]);
+                    if (useIC)
+                    {
+                        // IC0 expects positive diagonals
+                        if (dv <= 0.0 || std::abs(dv) < iluDiagFloorEff) dv = iluDiagFloorEff;
+                    }
+                    else
+                    {
+                        // ILU0: avoid near-zero diagonals, preserve sign
+                        if (std::abs(dv) < iluDiagFloorEff) dv = (dv >= 0.0 ? iluDiagFloorEff : -iluDiagFloorEff);
+                    }
+                    iluValsHost[diagK] = static_cast<DeviceScalar>(dv);
+                }
+            }
+        }
+
         if (cudaMalloc(reinterpret_cast<void**>(&d_iluVals), sizeof(DeviceScalar)*nnz) != cudaSuccess)
         {
             iluDisableReason = std::string("allocVals");
         }
-        else if (cudaMemcpy(d_iluVals, d_vals, sizeof(DeviceScalar)*nnz, cudaMemcpyDeviceToDevice) != cudaSuccess)
+        else if (cudaMemcpy(d_iluVals, iluValsHost.begin(), sizeof(DeviceScalar)*nnz, cudaMemcpyHostToDevice) != cudaSuccess)
         {
             iluDisableReason = std::string("copyVals");
         }
@@ -2328,6 +2370,72 @@ using DeviceScalar = double;
                 }
             }
             // No descriptor state to restore when using transient DnVecs
+            return true;
+        }
+        else if (useComposite && icReady && (colourOperational && colourReady))
+        {
+            // Composite: a few coloured sweeps, then IC0
+            const label sweeps = std::max<label>(1, controlDict_.lookupOrDefault<label>("compositeColourSweeps", 2));
+            // First sweep: rhs -> out
+            if (!applyColourDevice(rhs, out, "compColour1"))
+            {
+                // If colour failed, fall back to IC only
+            }
+            else
+            {
+                // Additional sweeps in-place on 'out'
+                for (label s = 1; s < sweeps; ++s)
+                {
+                    if (!applyColourDevice(out, out, "compColourN"))
+                    {
+                        break;
+                    }
+                }
+            }
+            // Apply IC on the (possibly smoothed) vector in 'out'
+            const double oneD = 1.0;
+            cusparseDnVecSetValues(preIn, out);
+            cusparseDnVecSetValues(preOut, d_preTmp);
+            if
+            (
+                cusparseSpSV_solve
+                (
+                    cusparseHandle,
+                    CUSPARSE_OPERATION_NON_TRANSPOSE,
+                    &oneD,
+                    matLchol,
+                    preIn,
+                    preOut,
+                    CUDA_R_64F,
+                    CUSPARSE_SPSV_ALG_DEFAULT,
+                    spsvLowerChol
+                ) != CUSPARSE_STATUS_SUCCESS
+            )
+            {
+                message = word("ICLowerFail");
+                return false;
+            }
+            cusparseDnVecSetValues(preIn, d_preTmp);
+            cusparseDnVecSetValues(preOut, out);
+            if
+            (
+                cusparseSpSV_solve
+                (
+                    cusparseHandle,
+                    CUSPARSE_OPERATION_TRANSPOSE,
+                    &oneD,
+                    matLchol,
+                    preIn,
+                    preOut,
+                    CUDA_R_64F,
+                    CUSPARSE_SPSV_ALG_DEFAULT,
+                    spsvUpperTChol
+                ) != CUSPARSE_STATUS_SUCCESS
+            )
+            {
+                message = word("ICUpperTFail");
+                return false;
+            }
             return true;
         }
         else if (icReady)

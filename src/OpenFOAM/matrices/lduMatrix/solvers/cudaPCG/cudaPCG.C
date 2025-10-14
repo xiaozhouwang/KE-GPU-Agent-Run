@@ -500,6 +500,44 @@ Foam::solverPerformance Foam::cudaPCG::solve
     dictionary cpuDict(controlDict_);
     cpuDict.set("solver", word("PCG"));
 
+    // Ensure CPU compatibility: translate GPU-only preconditioners
+    // If the case configured an unknown preconditioner (e.g. "sgs" or "colour"),
+    // fall back to a stock CPU preconditioner to avoid runtime aborts
+    // when constructing the CPU PCG.
+    {
+        const word precon = cpuDict.lookupOrDefault<word>("preconditioner", word("DIC"));
+        const word lower = toLower(precon);
+
+        // Normalise to CPU-registered names
+        if (lower == word("sgs") || lower == word("symgaussseidel")
+         || lower == word("ic") || lower == word("dic")
+         || lower == word("colour") || lower == word("colored") || lower == word("coloured"))
+        {
+            cpuDict.set("preconditioner", word("DIC"));
+        }
+        else if (lower == word("fdic"))
+        {
+            cpuDict.set("preconditioner", word("FDIC"));
+        }
+        else if (lower == word("gamg"))
+        {
+            cpuDict.set("preconditioner", word("GAMG"));
+        }
+        else if (lower == word("diagonal") || lower == word("none"))
+        {
+            // keep as-is (already lowercase) – both are registered names
+            cpuDict.set("preconditioner", lower);
+        }
+
+        // Remove GPU-only tuning entries that some CPU preconditioners do not recognise
+        // (silently ignore if absent).
+        cpuDict.remove("colourOmega");
+        cpuDict.remove("colourBackwardOmega");
+        cpuDict.remove("polyJacobiAuto");
+        cpuDict.remove("polyJacobiSweeps");
+        cpuDict.remove("jacobiOmega");
+    }
+
     autoPtr<lduMatrix::solver> cpuSolver = lduMatrix::solver::New
     (
         fieldName_,
@@ -645,6 +683,7 @@ bool Foam::cudaPCG::gpuSolve
     double iterationAccumSeconds = 0.0;
     double iterationMaxSeconds = 0.0;
     label iterationCountStats = 0;
+    label stallCounter = 0;
 
     cudaError_t cudaCode = cudaSetDevice(deviceId);
     if (cudaCode != cudaSuccess)
@@ -679,25 +718,65 @@ using DeviceScalar = double;
     }
 
     const scalarField& diag = matrix_.diag();
+    const scalar diagFloorAbsCfg =
+        controlDict_.lookupOrDefault<scalar>("preconditionerDiagFloor", scalar(1e-20));
+    const scalar diagFloorRelCfg =
+        controlDict_.lookupOrDefault<scalar>("preconditionerDiagRelFloor", scalar(0));
+
     scalar minDiag = std::numeric_limits<scalar>::max();
     scalar maxDiag = -std::numeric_limits<scalar>::max();
+    scalar maxAbsDiag = 0;
     for (const scalar d : diag)
     {
         minDiag = std::min(minDiag, d);
         maxDiag = std::max(maxDiag, d);
+        maxAbsDiag = std::max(maxAbsDiag, mag(d));
+    }
+
+    const scalar diagFloorCfg = std::max(diagFloorAbsCfg, diagFloorRelCfg*maxAbsDiag);
+
+    const labelUList& upperAddr = matrix_.lduAddr().upperAddr();
+    const labelUList& lowerAddr = matrix_.lduAddr().lowerAddr();
+    const scalarField& upper = matrix_.upper();
+
+    scalarField dicDiag(diag);
+    forAll(dicDiag, i)
+    {
+        scalar& d = dicDiag[i];
+        d = std::max(mag(d), diagFloorCfg);
+    }
+
+    const label nFaces = upper.size();
+    for (label face = 0; face < nFaces; ++face)
+    {
+        const label upCell = upperAddr[face];
+        const label lowCell = lowerAddr[face];
+        const scalar lowDiag = dicDiag[lowCell];
+        const scalar denom = std::max(mag(lowDiag), diagFloorCfg);
+        dicDiag[upCell] -= (upper[face]*upper[face])/denom;
+    }
+
+    scalar minDiagReg = std::numeric_limits<scalar>::max();
+    scalar maxDiagReg = -std::numeric_limits<scalar>::max();
+    List<DeviceScalar> precondDiag(dicDiag.size());
+    List<DeviceScalar> diagInv(dicDiag.size());
+
+    forAll(dicDiag, i)
+    {
+        scalar reg = std::max(mag(dicDiag[i]), diagFloorCfg);
+        minDiagReg = std::min(minDiagReg, reg);
+        maxDiagReg = std::max(maxDiagReg, reg);
+        precondDiag[i] = static_cast<DeviceScalar>(reg);
+        diagInv[i] = mag(reg) > VSMALL
+            ? static_cast<DeviceScalar>(1.0/reg)
+            : static_cast<DeviceScalar>(0);
     }
 
     if (reportStats)
     {
         Info<< "cudaPCG: diagonal range [" << minDiag << ", " << maxDiag << "]"
+            << " (regularised [" << minDiagReg << ", " << maxDiagReg << "])"
             << nl;
-    }
-
-    List<DeviceScalar> diagInv(diag.size());
-    forAll(diag, i)
-    {
-        const scalar d = diag[i];
-        diagInv[i] = mag(d) > VSMALL ? static_cast<DeviceScalar>(1.0/d) : static_cast<DeviceScalar>(0);
     }
 
     DeviceScalar *d_vals=nullptr, *d_x=nullptr, *d_b=nullptr;
@@ -746,6 +825,13 @@ using DeviceScalar = double;
     bool usePolyJacobi = (!useColour && !useSGS) && ((polySweepsCfg > 0) || polyAuto);
     label polySweepsEff = polySweepsCfg;
     double jacOmegaEff = static_cast<double>(jacOmegaCfg);
+
+    const Switch earlyAbortOnStall =
+        controlDict_.lookupOrDefault<Switch>("earlyAbortOnStall", Switch(false));
+    const label stallWindow =
+        std::max<label>(1, controlDict_.lookupOrDefault<label>("stallWindow", 50));
+    const scalar stallRatioTol =
+        controlDict_.lookupOrDefault<scalar>("stallRatioTol", scalar(0.99));
 
     const scalar colourOmegaCfg = controlDict_.lookupOrDefault<scalar>("colourOmega", scalar(0.65));
     const scalar colourBackwardOmegaCfg = controlDict_.lookupOrDefault<scalar>("colourBackwardOmega", scalar(0.85));
@@ -1239,6 +1325,8 @@ using DeviceScalar = double;
 
     // Build optional SGS preconditioner structures: CSR of (D+L)
     bool sgsReady = false;
+    bool sgsBuiltSuccessfully = false;
+    std::string sgsDisableReason;
     int preRows = 0, preNnz = 0;
     if (useSGS)
     {
@@ -1267,9 +1355,11 @@ using DeviceScalar = double;
                 if (j <= i)
                 {
                     preColIndHost[cursor] = j;
-                    // Optional tiny diagonal regularisation if needed
                     DeviceScalar v = values[k];
-                    if (j == i && std::abs(v) < 1e-20) v = (v >= 0 ? 1 : -1)*1e-20;
+                    if (j == i)
+                    {
+                        v = precondDiag[i];
+                    }
                     preValsHost[cursor] = v;
                     ++cursor;
                 }
@@ -1384,10 +1474,15 @@ using DeviceScalar = double;
                         )
                         {
                             sgsReady = true;
+                            sgsBuiltSuccessfully = true;
                         }
                     }
                 }
             }
+        }
+        else
+        {
+            sgsDisableReason = std::string("allocOrDescrCreate");
         }
     }
 
@@ -1891,6 +1986,22 @@ using DeviceScalar = double;
         return applyDiagonalDevice(rhs, out);
     };
 
+    // Emit one-line SGS status when requested
+    if (reportStats && useSGS)
+    {
+        if (sgsReady)
+        {
+            Info<< "cudaPCG(" << fieldName_ << "): SGS preconditioner active (rows="
+                << rows << ", nnz=" << preNnz << ")" << nl;
+        }
+        else
+        {
+            Info<< "cudaPCG(" << fieldName_ << "): SGS preconditioner disabled ("
+                << (sgsDisableReason.size() ? sgsDisableReason : std::string("buildFailure"))
+                << ")" << nl;
+        }
+    }
+
     const double alpha = 1.0;
     const double zero = 0.0;
     const double negOne = -1.0;
@@ -2291,6 +2402,32 @@ using DeviceScalar = double;
         sumAbs = returnReduce(static_cast<scalar>(sumAbsDevice), sumOp<scalar>());
 
         solverPerf.finalResidual() = sumAbs/normFactor;
+
+        if (earlyAbortOnStall)
+        {
+            const scalar initRes = solverPerf.initialResidual();
+            if (initRes > VSMALL)
+            {
+                scalar ratio = solverPerf.finalResidual()/initRes;
+                if (!std::isfinite(ratio))
+                {
+                    return fail("stallDetected");
+                }
+                if (ratio > stallRatioTol)
+                {
+                    ++stallCounter;
+                }
+                else
+                {
+                    stallCounter = 0;
+                }
+
+                if (stallCounter >= stallWindow)
+                {
+                    return fail("stallDetected");
+                }
+            }
+        }
 
         ++iter;
         solverPerf.nIterations() = iter;

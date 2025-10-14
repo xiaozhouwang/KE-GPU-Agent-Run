@@ -519,6 +519,11 @@ Foam::solverPerformance Foam::cudaPCG::solve
         {
             cpuDict.set("preconditioner", word("FDIC"));
         }
+        else if (lower == word("ilu0") || lower == word("ilu"))
+        {
+            // No ILU preconditioner in CPU registry; map to DIC
+            cpuDict.set("preconditioner", word("DIC"));
+        }
         else if (lower == word("gamg"))
         {
             cpuDict.set("preconditioner", word("GAMG"));
@@ -837,7 +842,7 @@ using DeviceScalar = double;
     label polySweepsCfg = controlDict_.lookupOrDefault<label>("polyJacobiSweeps", 0);
     scalar jacOmegaCfg = controlDict_.lookupOrDefault<scalar>("jacobiOmega", scalar(0.7));
     const Switch polyAuto = controlDict_.lookupOrDefault<Switch>("polyJacobiAuto", Switch(true));
-    bool usePolyJacobi = (!useColour && !useSGS) && ((polySweepsCfg > 0) || polyAuto);
+    bool usePolyJacobi = (!useColour && !useSGS && !useILU && !useIC) && ((polySweepsCfg > 0) || polyAuto);
     label polySweepsEff = polySweepsCfg;
     double jacOmegaEff = static_cast<double>(jacOmegaCfg);
 
@@ -1569,6 +1574,12 @@ using DeviceScalar = double;
             {
                 if (cusparseCreateCsrilu02Info(&iluInfo) == CUSPARSE_STATUS_SUCCESS)
                 {
+                    // Optional numeric boost to avoid zero pivots
+                    const Switch iluNumericBoost = controlDict_.lookupOrDefault<Switch>("iluNumericBoost", Switch(false));
+                    const scalar iluBoostTolCfg = controlDict_.lookupOrDefault<scalar>("iluNumericBoostTol", diagFloorCfg);
+                    const scalar iluBoostValCfg = controlDict_.lookupOrDefault<scalar>("iluNumericBoostVal", diagFloorCfg);
+                    double boostTol = static_cast<double>(iluBoostTolCfg);
+                    double boostVal = static_cast<double>(iluBoostValCfg);
                     int bs = 0;
                     if
                     (
@@ -1590,6 +1601,17 @@ using DeviceScalar = double;
                             iluInfo, CUSPARSE_SOLVE_POLICY_NO_LEVEL,
                             iluBuf
                         ) == CUSPARSE_STATUS_SUCCESS
+                     && (
+                        (!iluNumericBoost)
+                        || (cusparseDcsrilu02_numericBoost
+                            (
+                                cusparseHandle,
+                                iluInfo,
+                                1,
+                                &boostTol,
+                                &boostVal
+                            ) == CUSPARSE_STATUS_SUCCESS)
+                       )
                      && cusparseDcsrilu02
                         (
                             cusparseHandle, rows, nnz,
@@ -1601,6 +1623,15 @@ using DeviceScalar = double;
                         ) == CUSPARSE_STATUS_SUCCESS
                     )
                     {
+                        // Zero pivot check
+                        int pivot = -1;
+                        cusparseStatus_t zp = cusparseXcsrilu02_zeroPivot(cusparseHandle, iluInfo, &pivot);
+                        if (zp == CUSPARSE_STATUS_ZERO_PIVOT)
+                        {
+                            iluDisableReason = std::string("zeroPivot");
+                        }
+                        else
+                        {
                         if
                         (
                             cusparseCreateCsr(&matL, rows, rows, nnz, d_rowPtr, d_colInd, d_iluVals,
@@ -1689,6 +1720,7 @@ using DeviceScalar = double;
                                 }
                             }
                         }
+                        }
                     }
                     else
                     {
@@ -1736,6 +1768,15 @@ using DeviceScalar = double;
                         ) == CUSPARSE_STATUS_SUCCESS
                     )
                     {
+                        // Zero pivot check (IC0)
+                        int pivot = -1;
+                        cusparseStatus_t zp = cusparseXcsric02_zeroPivot(cusparseHandle, icInfo, &pivot);
+                        if (zp == CUSPARSE_STATUS_ZERO_PIVOT)
+                        {
+                            iluDisableReason = std::string("zeroPivot");
+                        }
+                        else
+                        {
                         if
                         (
                             cusparseCreateCsr(&matLchol, rows, rows, nnz, d_rowPtr, d_colInd, d_iluVals,
@@ -1817,6 +1858,7 @@ using DeviceScalar = double;
                                     }
                                 }
                             }
+                        }
                         }
                     }
                     else

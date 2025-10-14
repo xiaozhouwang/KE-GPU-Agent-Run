@@ -106,8 +106,6 @@ protected:
         // GPU configuration
 
             bool useGpu_;
-            bool gpuOperational_;
-            label gpuDeviceId_;
 
         //- Refresh GPU configuration values from the coefficients dictionary
         void refreshGpuConfig();

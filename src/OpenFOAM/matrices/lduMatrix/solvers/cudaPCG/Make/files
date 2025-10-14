@@ -1,0 +1,4 @@
+cudaPCG.C
+CsrExport.C
+
+LIB = $(FOAM_USER_LIBBIN)/libcudaPCG

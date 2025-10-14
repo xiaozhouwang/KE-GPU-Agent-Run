@@ -1,0 +1,3 @@
+fields/gpuField/gpuField.C
+
+LIB = $(FOAM_USER_LIBBIN)/libgpuFoamPrimitives

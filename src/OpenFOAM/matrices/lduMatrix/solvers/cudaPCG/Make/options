@@ -1,19 +1,18 @@
 EXE_INC = \
-    -I../momentumTransportModels/lnInclude \
-    -I$(LIB_SRC)/physicalProperties/lnInclude \
+    -I$(LIB_SRC)/OpenFOAM/lnInclude \
     -I$(LIB_SRC)/finiteVolume/lnInclude \
     -I$(LIB_SRC)/meshTools/lnInclude \
-    -I$(LIB_SRC)/gpuInfrastructure/lnInclude \
     -I/usr/local/cuda/include \
     -DFOAM_USE_CUDA
 
 LIB_LIBS = \
-    -L$(FOAM_USER_LIBBIN) \
-    -lphysicalProperties \
-    -lmomentumTransportModels \
+    -lOpenFOAM \
     -lfiniteVolume \
     -lmeshTools \
-    -lgpuInfrastructure \
     -L/usr/local/cuda/lib64 \
     -lcuda \
+    -lcudart \
+    -lcusparse \
+    -lcusolver \
+    -lcublas \
     -lnvrtc

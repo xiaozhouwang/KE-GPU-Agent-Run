@@ -514,7 +514,7 @@ while (pimple.correctNonOrthogonal())
 
                 forAll(phiBf, patchi)
                 {
-                    phiBf[patchi] ==
+                    phiBf[patchi] =
                         phiHbyABf[patchi] - phiFluxBf[patchi];
                 }
 

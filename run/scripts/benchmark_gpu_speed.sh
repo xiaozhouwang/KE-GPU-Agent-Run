@@ -34,9 +34,11 @@ foamDictionary -entry "PIMPLE/useGpuFieldOps" -set true "${GPU_CASE}/system/fvSo
 foamDictionary -entry "PIMPLE/logGpuFieldOps" -set false "${GPU_CASE}/system/fvSolution" >/dev/null
 foamDictionary -entry "PIMPLE/logGpuFieldOps" -set false "${CPU_CASE}/system/fvSolution" >/dev/null 2>&1 || true
 foamDictionary -entry "PIMPLE/useGpuCudaGraphs" -set true "${GPU_CASE}/system/fvSolution" >/dev/null 2>&1 || true
-
 # Default to enabling CUDA Graphs unless caller overrides.
 export FOAM_GPU_ENABLE_CUDA_GRAPHS="${FOAM_GPU_ENABLE_CUDA_GRAPHS:-1}"
+
+# Watchdog timeout for GPU runs (seconds)
+GPU_TRIAL_TIMEOUT_SEC=${GPU_TRIAL_TIMEOUT_SEC:-600}
 
 run_case() {
     local solver=$1
@@ -44,7 +46,14 @@ run_case() {
     (
         cd "${caseDir}"
         blockMesh -dict "$FOAM_TUTORIALS/resources/blockMesh/pitzDaily" > log.blockMesh
-        ${solver} > log.${solver}
+        if [[ "${solver}" == "${GPU_SOLVER}" ]]; then
+            timeout -k 10 ${GPU_TRIAL_TIMEOUT_SEC}s ${solver} > log.${solver} || {
+                echo "GPU run exceeded ${GPU_TRIAL_TIMEOUT_SEC}s or failed; see log.${solver}" >&2
+                exit 124
+            }
+        else
+            ${solver} > log.${solver}
+        fi
     )
 }
 

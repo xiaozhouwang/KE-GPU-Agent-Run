@@ -67,12 +67,18 @@ set_turbulence_gpu_flag()
 set_turbulence_gpu_flag "${CPU_CASE}" false
 set_turbulence_gpu_flag "${GPU_CASE}" true
 
+# Watchdog timeout for GPU parity run (seconds)
+GPU_TRIAL_TIMEOUT_SEC=${GPU_TRIAL_TIMEOUT_SEC:-600}
+
 run_case() {
     local caseDir=$1
     (
         cd "${caseDir}"
         blockMesh -dict "$FOAM_TUTORIALS/resources/blockMesh/pitzDaily" > log.blockMesh
-        pimpleFoamGPU > log.pimpleFoamGPU
+        timeout -k 10 ${GPU_TRIAL_TIMEOUT_SEC}s pimpleFoamGPU > log.pimpleFoamGPU || {
+            echo "Parity GPU run exceeded ${GPU_TRIAL_TIMEOUT_SEC}s or failed; see log.pimpleFoamGPU" >&2
+            exit 124
+        }
     )
 }
 

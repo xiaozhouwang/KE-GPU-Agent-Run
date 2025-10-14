@@ -1,6 +1,9 @@
 #include "FieldOps.H"
 #include "error.H"
+#include "KernelCache.H"
+#include "OSspecific.H"
 
+#include <cctype>
 #include <string>
 #include <sstream>
 
@@ -19,43 +22,9 @@ namespace gpu
 namespace
 {
 
-std::string nvrtcErrorString(const nvrtcResult code)
+const std::string& surfaceSubtractSource()
 {
-    return std::string(nvrtcGetErrorString(code))
-        + " (" + Foam::name(static_cast<int>(code)) + ')';
-}
-
-
-std::string cudaDriverErrorString(const CUresult code)
-{
-    const char* msg = nullptr;
-    cuGetErrorString(code, &msg);
-    if (msg)
-    {
-        return std::string(msg)
-            + " (" + Foam::name(static_cast<int>(code)) + ')';
-    }
-    return "cuda driver error (" + Foam::name(static_cast<int>(code)) + ')';
-}
-
-
-bool compileSurfaceSubtractKernel(CUmodule& module, CUfunction& function, word& error)
-{
-    static bool initialised = false;
-    static CUmodule cachedModule = nullptr;
-    static CUfunction cachedFunction = nullptr;
-
-    if (initialised)
-    {
-        module = cachedModule;
-        function = cachedFunction;
-        error.clear();
-        return cachedModule != nullptr && cachedFunction != nullptr;
-    }
-
-    initialised = true;
-
-    const char* source = R"(
+    static const std::string src = R"(
 extern "C" __global__
 void surfaceSubtract(double* dst, const double* a, const double* b, int n)
 {
@@ -66,81 +35,112 @@ void surfaceSubtract(double* dst, const double* a, const double* b, int n)
     }
 }
 )";
+    return src;
+}
 
-    nvrtcProgram prog;
-    nvrtcResult nvStatus = nvrtcCreateProgram
-    (
-        &prog,
-        source,
-        "surfaceSubtract.cu",
-        0,
-        nullptr,
-        nullptr
-    );
 
-    if (nvStatus != NVRTC_SUCCESS)
+const std::string& velocityCorrectorAoSSource()
+{
+    static const std::string src = R"(
+extern "C" __global__
+void velocityCorrector(double* u, const double* h, const double* grad, const double* r, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
     {
-        error = "nvrtcCreateProgram failed: " + nvrtcErrorString(nvStatus);
-        return false;
+        double rVal = r[idx];
+        int base = idx * 3;
+        u[base]     = h[base]     - rVal * grad[base];
+        u[base + 1] = h[base + 1] - rVal * grad[base + 1];
+        u[base + 2] = h[base + 2] - rVal * grad[base + 2];
+    }
+}
+)";
+    return src;
+}
+
+
+const std::string& velocityCorrectorSoASource()
+{
+    static const std::string src = R"(
+extern "C" __global__
+void velocityCorrectorSoA
+(
+    double* u,
+    const double* hx,
+    const double* hy,
+    const double* hz,
+    const double* gx,
+    const double* gy,
+    const double* gz,
+    const double* r,
+    int n
+)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+    {
+        double rVal = r[idx];
+        int base = idx * 3;
+        u[base]     = hx[idx] - rVal * gx[idx];
+        u[base + 1] = hy[idx] - rVal * gy[idx];
+        u[base + 2] = hz[idx] - rVal * gz[idx];
+    }
+}
+)";
+    return src;
+}
+
+
+const std::string& computeNutKernelSource()
+{
+    static const std::string src = R"(
+extern "C" __global__
+void computeNut(double* nut, const double* k, const double* epsilon,
+                const double Cmu, const double kMin, const double epsilonMin,
+                const int n)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n)
+    {
+        return;
     }
 
-    int deviceId = 0;
-    cudaGetDevice(&deviceId);
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, deviceId);
-    std::ostringstream arch;
-    arch<< "--gpu-architecture=compute_" << prop.major << prop.minor;
-    const std::string archStr = arch.str();
-    const char* options[] = { "--std=c++14", archStr.c_str() };
-    nvStatus = nvrtcCompileProgram(prog, 2, options);
-
-    if (nvStatus != NVRTC_SUCCESS)
+    double kval = k[idx];
+    if (kval < kMin)
     {
-        size_t logSize = 0;
-        nvrtcGetProgramLogSize(prog, &logSize);
-        std::string log(logSize, '\0');
-        if (logSize > 1)
+        kval = kMin;
+    }
+
+    double eps = epsilon[idx];
+    if (eps < epsilonMin)
+    {
+        eps = epsilonMin;
+    }
+
+    const double value = Cmu * kval * kval / eps;
+    nut[idx] = value;
+}
+)";
+    return src;
+}
+
+
+bool preferVectorSoA()
+{
+    static const bool prefer = []
+    {
+        word value = getEnv("FOAM_GPU_PREFER_SOA");
+        for (char& c : value)
         {
-            nvrtcGetProgramLog(prog, &log[0]);
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         }
-
-        error = "nvrtcCompileProgram failed: " + nvrtcErrorString(nvStatus);
-        if (!log.empty())
-        {
-            error += " :: " + log;
-        }
-        nvrtcDestroyProgram(&prog);
-        return false;
-    }
-
-    size_t ptxSize = 0;
-    nvrtcGetPTXSize(prog, &ptxSize);
-    std::string ptx(ptxSize, '\0');
-    nvrtcGetPTX(prog, &ptx[0]);
-    nvrtcDestroyProgram(&prog);
-
-    CUresult cuStatus = cuModuleLoadData(&cachedModule, ptx.c_str());
-    if (cuStatus != CUDA_SUCCESS)
-    {
-        error = "cuModuleLoadData failed: " + cudaDriverErrorString(cuStatus);
-        cachedModule = nullptr;
-        cachedFunction = nullptr;
-        return false;
-    }
-
-    cuStatus = cuModuleGetFunction(&cachedFunction, cachedModule, "surfaceSubtract");
-    if (cuStatus != CUDA_SUCCESS)
-    {
-        error = "cuModuleGetFunction failed: " + cudaDriverErrorString(cuStatus);
-        cachedModule = nullptr;
-        cachedFunction = nullptr;
-        return false;
-    }
-
-    module = cachedModule;
-    function = cachedFunction;
-    error.clear();
-    return true;
+        return value == "1"
+            || value == "true"
+            || value == "on"
+            || value == "yes";
+    }();
+    return prefer;
 }
 
 } // namespace
@@ -174,13 +174,6 @@ bool subtractSurfaceScalarFields
         }
     }
 
-    CUmodule module = nullptr;
-    CUfunction function = nullptr;
-    if (!compileSurfaceSubtractKernel(module, function, error))
-    {
-        return false;
-    }
-
     const label n = dst.size();
     if (n == 0)
     {
@@ -210,55 +203,55 @@ bool subtractSurfaceScalarFields
 
     void* args[] = { &dstPtr, &aPtr, &bPtr, &nCells };
 
-    cudaEvent_t startEvent = nullptr;
-    cudaEvent_t stopEvent = nullptr;
-
-    if (stats)
+    CompiledKernel kernel;
+    static const word kernelKey("surfaceSubtract");
+    if
+    (
+        !KernelCache::instance().getOrCompile
+        (
+            ctx,
+            kernelKey,
+            surfaceSubtractSource(),
+            {},
+            "surfaceSubtract",
+            kernel,
+            error
+        )
+    )
     {
-        cudaEventCreateWithFlags(&startEvent, cudaEventDefault);
-        cudaEventCreateWithFlags(&stopEvent, cudaEventDefault);
-        cudaEventRecord(startEvent, ctx.stream());
+        return false;
     }
 
-    CUresult status = cuLaunchKernel
-    (
-        function,
-        gridSize, 1, 1,
-        blockSize, 1, 1,
-        0,
-        reinterpret_cast<CUstream>(ctx.stream()),
-        args,
-        nullptr
-    );
+    scalar elapsedMs = 0;
 
-    if (status != CUDA_SUCCESS)
+    if
+    (
+        !GraphLaunchCache::instance().launch
+        (
+            ctx,
+            kernelKey,
+            kernel,
+            StreamCategory::aux,
+            dim3(gridSize, 1, 1),
+            dim3(blockSize, 1, 1),
+            args,
+            sizeof(args)/sizeof(args[0]),
+            0,
+            error,
+            stats != nullptr,
+            elapsedMs
+        )
+    )
     {
-        error = "cuLaunchKernel failed: " + cudaDriverErrorString(status);
         return false;
     }
 
     if (stats)
     {
-        cudaEventRecord(stopEvent, ctx.stream());
-        cudaEventSynchronize(stopEvent);
-
-        float ms = 0.0f;
-        cudaEventElapsedTime(&ms, startEvent, stopEvent);
-
-        stats->gpuMilliseconds = static_cast<scalar>(ms);
-        cudaEventDestroy(startEvent);
-        cudaEventDestroy(stopEvent);
-    }
-    else
-    {
-        status = cuStreamSynchronize(reinterpret_cast<CUstream>(ctx.stream()));
-        if (status != CUDA_SUCCESS)
-        {
-            error = "cuStreamSynchronize failed: " + cudaDriverErrorString(status);
-            return false;
-        }
+        stats->gpuMilliseconds = elapsedMs;
     }
 
+    dst.markDeviceDirty();
     error.clear();
     return true;
 #else
@@ -270,116 +263,6 @@ bool subtractSurfaceScalarFields
     return false;
 #endif
 }
-
-#ifdef FOAM_USE_CUDA
-bool compileVelocityCorrectorKernel(CUmodule& module, CUfunction& function, word& error)
-{
-    static bool initialised = false;
-    static CUmodule cachedModule = nullptr;
-    static CUfunction cachedFunction = nullptr;
-
-    if (initialised)
-    {
-        module = cachedModule;
-        function = cachedFunction;
-        error.clear();
-        return cachedModule != nullptr && cachedFunction != nullptr;
-    }
-
-    initialised = true;
-
-    const char* source = R"(
-extern "C" __global__
-void velocityCorrector(double* u, const double* h, const double* grad, const double* r, int n)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n)
-    {
-        double rVal = r[idx];
-        int base = idx * 3;
-        u[base]     = h[base]     - rVal * grad[base];
-        u[base + 1] = h[base + 1] - rVal * grad[base + 1];
-        u[base + 2] = h[base + 2] - rVal * grad[base + 2];
-    }
-}
-)";
-
-    nvrtcProgram prog;
-    nvrtcResult nvStatus = nvrtcCreateProgram
-    (
-        &prog,
-        source,
-        "velocityCorrector.cu",
-        0,
-        nullptr,
-        nullptr
-    );
-
-    if (nvStatus != NVRTC_SUCCESS)
-    {
-        error = "nvrtcCreateProgram failed: " + nvrtcErrorString(nvStatus);
-        return false;
-    }
-
-    int deviceId = 0;
-    cudaGetDevice(&deviceId);
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, deviceId);
-    std::ostringstream arch;
-    arch<< "--gpu-architecture=compute_" << prop.major << prop.minor;
-    const std::string archStr = arch.str();
-    const char* options[] = { "--std=c++14", archStr.c_str() };
-    nvStatus = nvrtcCompileProgram(prog, 2, options);
-
-    if (nvStatus != NVRTC_SUCCESS)
-    {
-        size_t logSize = 0;
-        nvrtcGetProgramLogSize(prog, &logSize);
-        std::string log(logSize, '\0');
-        if (logSize > 1)
-        {
-            nvrtcGetProgramLog(prog, &log[0]);
-        }
-
-        error = "nvrtcCompileProgram failed: " + nvrtcErrorString(nvStatus);
-        if (!log.empty())
-        {
-            error += " :: " + log;
-        }
-        nvrtcDestroyProgram(&prog);
-        return false;
-    }
-
-    size_t ptxSize = 0;
-    nvrtcGetPTXSize(prog, &ptxSize);
-    std::string ptx(ptxSize, '\0');
-    nvrtcGetPTX(prog, &ptx[0]);
-    nvrtcDestroyProgram(&prog);
-
-    CUresult cuStatus = cuModuleLoadData(&cachedModule, ptx.c_str());
-    if (cuStatus != CUDA_SUCCESS)
-    {
-        error = "cuModuleLoadData failed: " + cudaDriverErrorString(cuStatus);
-        cachedModule = nullptr;
-        cachedFunction = nullptr;
-        return false;
-    }
-
-    cuStatus = cuModuleGetFunction(&cachedFunction, cachedModule, "velocityCorrector");
-    if (cuStatus != CUDA_SUCCESS)
-    {
-        error = "cuModuleGetFunction failed: " + cudaDriverErrorString(cuStatus);
-        cachedModule = nullptr;
-        cachedFunction = nullptr;
-        return false;
-    }
-
-    module = cachedModule;
-    function = cachedFunction;
-    error.clear();
-    return true;
-}
-#endif
 
 
 bool velocityCorrector
@@ -408,13 +291,6 @@ bool velocityCorrector
         {
             return false;
         }
-    }
-
-    CUmodule module = nullptr;
-    CUfunction function = nullptr;
-    if (!compileVelocityCorrectorKernel(module, function, error))
-    {
-        return false;
     }
 
     const label n = U.size();
@@ -448,57 +324,162 @@ bool velocityCorrector
     const unsigned int blockSize = 256;
     const unsigned int gridSize = (nCells + blockSize - 1)/blockSize;
 
-    void* args[] = { &uPtr, &hPtr, &gradPtr, &rPtr, &nCells };
+    scalar elapsedMs = 0;
 
-    cudaEvent_t startEvent = nullptr;
-    cudaEvent_t stopEvent = nullptr;
+    const bool useSoA =
+        preferVectorSoA()
+     && HbyA.supportsSoA()
+     && gradP.supportsSoA();
 
-    if (stats)
+    CompiledKernel kernel;
+
+    if (useSoA)
     {
-        cudaEventCreateWithFlags(&startEvent, cudaEventDefault);
-        cudaEventCreateWithFlags(&stopEvent, cudaEventDefault);
-        cudaEventRecord(startEvent, ctx.stream());
-    }
+        DeviceField<volVectorField>& hMutable =
+            const_cast<DeviceField<volVectorField>&>(HbyA);
+        DeviceField<volVectorField>& gradMutable =
+            const_cast<DeviceField<volVectorField>&>(gradP);
 
-    CUresult status = cuLaunchKernel
-    (
-        function,
-        gridSize, 1, 1,
-        blockSize, 1, 1,
-        0,
-        reinterpret_cast<CUstream>(ctx.stream()),
-        args,
-        nullptr
-    );
+        if
+        (
+            !hMutable.ensureSoALayout(ctx, error)
+         || !gradMutable.ensureSoALayout(ctx, error)
+        )
+        {
+            return false;
+        }
 
-    if (status != CUDA_SUCCESS)
-    {
-        error = "cuLaunchKernel failed: " + cudaDriverErrorString(status);
-        return false;
-    }
+        double* hSoA =
+            const_cast<double*>
+            (
+                reinterpret_cast<const double*>(hMutable.soaPointer())
+            );
+        double* gradSoA =
+            const_cast<double*>
+            (
+                reinterpret_cast<const double*>(gradMutable.soaPointer())
+            );
 
-    if (stats)
-    {
-        cudaEventRecord(stopEvent, ctx.stream());
-        cudaEventSynchronize(stopEvent);
+        if (!hSoA || !gradSoA)
+        {
+            error = "velocityCorrector: SoA pointers are null";
+            return false;
+        }
 
-        float ms = 0.0f;
-        cudaEventElapsedTime(&ms, startEvent, stopEvent);
+        double* hx = hSoA;
+        double* hy = hSoA + n;
+        double* hz = hSoA + n*2;
 
-        stats->gpuMilliseconds = static_cast<scalar>(ms);
-        cudaEventDestroy(startEvent);
-        cudaEventDestroy(stopEvent);
+        double* gx = gradSoA;
+        double* gy = gradSoA + n;
+        double* gz = gradSoA + n*2;
+
+        void* args[] =
+        {
+            &uPtr,
+            &hx,
+            &hy,
+            &hz,
+            &gx,
+            &gy,
+            &gz,
+            &rPtr,
+            &nCells
+        };
+
+        static const word kernelKey("velocityCorrectorSoA");
+
+        if
+        (
+            !KernelCache::instance().getOrCompile
+            (
+                ctx,
+                kernelKey,
+                velocityCorrectorSoASource(),
+                {},
+                "velocityCorrectorSoA",
+                kernel,
+                error
+            )
+        )
+        {
+            return false;
+        }
+
+        if
+        (
+            !GraphLaunchCache::instance().launch
+        (
+            ctx,
+            kernelKey,
+            kernel,
+            StreamCategory::compute,
+            dim3(gridSize, 1, 1),
+            dim3(blockSize, 1, 1),
+            args,
+            sizeof(args)/sizeof(args[0]),
+            0,
+                error,
+                stats != nullptr,
+                elapsedMs
+            )
+        )
+        {
+            return false;
+        }
     }
     else
     {
-        status = cuStreamSynchronize(reinterpret_cast<CUstream>(ctx.stream()));
-        if (status != CUDA_SUCCESS)
+        void* args[] = { &uPtr, &hPtr, &gradPtr, &rPtr, &nCells };
+
+        static const word kernelKey("velocityCorrectorAoS");
+
+        if
+        (
+            !KernelCache::instance().getOrCompile
+            (
+                ctx,
+                kernelKey,
+                velocityCorrectorAoSSource(),
+                {},
+                "velocityCorrector",
+                kernel,
+                error
+            )
+        )
         {
-            error = "cuStreamSynchronize failed: " + cudaDriverErrorString(status);
+            return false;
+        }
+
+        if
+        (
+            !GraphLaunchCache::instance().launch
+        (
+            ctx,
+            kernelKey,
+            kernel,
+            StreamCategory::compute,
+            dim3(gridSize, 1, 1),
+            dim3(blockSize, 1, 1),
+            args,
+            sizeof(args)/sizeof(args[0]),
+            0,
+                error,
+                stats != nullptr,
+                elapsedMs
+            )
+        )
+        {
             return false;
         }
     }
 
+    if (stats)
+    {
+        stats->gpuMilliseconds = elapsedMs;
+    }
+
+    U.markDeviceDirty();
     error.clear();
     return true;
 #else
@@ -512,136 +493,6 @@ bool velocityCorrector
     return false;
 #endif
 }
-
-#ifdef FOAM_USE_CUDA
-namespace
-{
-
-bool compileNutKernel(CUmodule& module, CUfunction& function, word& error)
-{
-    static bool initialised = false;
-    static CUmodule cachedModule = nullptr;
-    static CUfunction cachedFunction = nullptr;
-
-    if (initialised)
-    {
-        module = cachedModule;
-        function = cachedFunction;
-        error.clear();
-        return cachedModule != nullptr && cachedFunction != nullptr;
-    }
-
-    initialised = true;
-
-    const char* source = R"(
-extern "C" __global__
-void computeNut(double* nut, const double* k, const double* epsilon,
-                const double Cmu, const double kMin, const double epsilonMin,
-                const int n)
-{
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n)
-    {
-        return;
-    }
-
-    double kval = k[idx];
-    if (kval < kMin)
-    {
-        kval = kMin;
-    }
-
-    double eps = epsilon[idx];
-    if (eps < epsilonMin)
-    {
-        eps = epsilonMin;
-    }
-
-    const double value = Cmu * kval * kval / eps;
-    nut[idx] = value;
-}
-)";
-
-    nvrtcProgram prog;
-    nvrtcResult nvStatus = nvrtcCreateProgram
-    (
-        &prog,
-        source,
-        "computeNut.cu",
-        0,
-        nullptr,
-        nullptr
-    );
-
-    if (nvStatus != NVRTC_SUCCESS)
-    {
-        error = "nvrtcCreateProgram failed: " + nvrtcErrorString(nvStatus);
-        return false;
-    }
-
-    int deviceId = 0;
-    cudaGetDevice(&deviceId);
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, deviceId);
-
-    std::ostringstream arch;
-    arch<< "--gpu-architecture=compute_" << prop.major << prop.minor;
-    const std::string archStr = arch.str();
-    const char* options[] = { "--std=c++14", archStr.c_str() };
-    nvStatus = nvrtcCompileProgram(prog, 2, options);
-
-    if (nvStatus != NVRTC_SUCCESS)
-    {
-        size_t logSize = 0;
-        nvrtcGetProgramLogSize(prog, &logSize);
-        std::string log(logSize, '\0');
-        if (logSize > 1)
-        {
-            nvrtcGetProgramLog(prog, &log[0]);
-        }
-
-        error = "nvrtcCompileProgram failed: " + nvrtcErrorString(nvStatus);
-        if (!log.empty())
-        {
-            error += " :: " + log;
-        }
-        nvrtcDestroyProgram(&prog);
-        return false;
-    }
-
-    size_t ptxSize = 0;
-    nvrtcGetPTXSize(prog, &ptxSize);
-    std::string ptx(ptxSize, '\0');
-    nvrtcGetPTX(prog, &ptx[0]);
-    nvrtcDestroyProgram(&prog);
-
-    CUresult cuStatus = cuModuleLoadData(&cachedModule, ptx.c_str());
-    if (cuStatus != CUDA_SUCCESS)
-    {
-        error = "cuModuleLoadData failed: " + cudaDriverErrorString(cuStatus);
-        cachedModule = nullptr;
-        cachedFunction = nullptr;
-        return false;
-    }
-
-    cuStatus = cuModuleGetFunction(&cachedFunction, cachedModule, "computeNut");
-    if (cuStatus != CUDA_SUCCESS)
-    {
-        error = "cuModuleGetFunction failed: " + cudaDriverErrorString(cuStatus);
-        cuModuleUnload(cachedModule);
-        cachedModule = nullptr;
-        cachedFunction = nullptr;
-        return false;
-    }
-
-    module = cachedModule;
-    function = cachedFunction;
-    error.clear();
-    return true;
-}
-
-} // namespace
-#endif
 
 
 bool computeNutFromKEpsilon
@@ -699,13 +550,6 @@ bool computeNutFromKEpsilon
         return false;
     }
 
-    CUmodule module = nullptr;
-    CUfunction function = nullptr;
-    if (!compileNutKernel(module, function, error))
-    {
-        return false;
-    }
-
     double* nutPtr = reinterpret_cast<double*>(nutMutable.devicePointer());
     double* kPtr = reinterpret_cast<double*>(kMutable.devicePointer());
     double* epsPtr = reinterpret_cast<double*>(epsilonMutable.devicePointer());
@@ -732,54 +576,53 @@ bool computeNutFromKEpsilon
         &cells
     };
 
-    cudaEvent_t startEvent = nullptr;
-    cudaEvent_t stopEvent = nullptr;
+    static const word kernelKey("computeNut");
+    CompiledKernel kernel;
 
-    if (stats)
+    if
+    (
+        !KernelCache::instance().getOrCompile
+        (
+            ctx,
+            kernelKey,
+            computeNutKernelSource(),
+            {},
+            "computeNut",
+            kernel,
+            error
+        )
+    )
     {
-        cudaEventCreateWithFlags(&startEvent, cudaEventDefault);
-        cudaEventCreateWithFlags(&stopEvent, cudaEventDefault);
-        cudaEventRecord(startEvent, ctx.stream());
+        return false;
     }
 
-    CUresult status = cuLaunchKernel
-    (
-        function,
-        (cells + 255)/256, 1, 1,
-        256, 1, 1,
-        0,
-        reinterpret_cast<CUstream>(ctx.stream()),
-        args,
-        nullptr
-    );
+    scalar elapsedMs = 0;
 
-    if (status != CUDA_SUCCESS)
+    if
+    (
+        !GraphLaunchCache::instance().launch
+        (
+            ctx,
+            kernelKey,
+            kernel,
+            StreamCategory::compute,
+            dim3((cells + 255)/256, 1, 1),
+            dim3(256, 1, 1),
+            args,
+            sizeof(args)/sizeof(args[0]),
+            0,
+            error,
+            stats != nullptr,
+            elapsedMs
+        )
+    )
     {
-        error = "cuLaunchKernel(computeNut) failed: "
-          + cudaDriverErrorString(status);
         return false;
     }
 
     if (stats)
     {
-        cudaEventRecord(stopEvent, ctx.stream());
-        cudaEventSynchronize(stopEvent);
-
-        float ms = 0.0f;
-        cudaEventElapsedTime(&ms, startEvent, stopEvent);
-        stats->gpuMilliseconds = static_cast<scalar>(ms);
-        cudaEventDestroy(startEvent);
-        cudaEventDestroy(stopEvent);
-    }
-    else
-    {
-        status = cuStreamSynchronize(reinterpret_cast<CUstream>(ctx.stream()));
-        if (status != CUDA_SUCCESS)
-        {
-            error = "cuStreamSynchronize failed: "
-              + cudaDriverErrorString(status);
-            return false;
-        }
+        stats->gpuMilliseconds = elapsedMs;
     }
 
     nutMutable.markDeviceDirty();

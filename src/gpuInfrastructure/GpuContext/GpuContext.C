@@ -15,7 +15,11 @@ Context::Context()
 :
     initialised_(false),
     deviceId_(-1),
-    stream_(nullptr)
+    computeStream_(nullptr),
+    transferStream_(nullptr),
+    auxStream_(nullptr),
+    deviceProps_(),
+    archTag_()
 #endif
 {}
 
@@ -55,11 +59,48 @@ bool Context::initialise(int deviceId, word& errMessage)
         return false;
     }
 
-    status = ::cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
+    status = ::cudaGetDeviceProperties(&deviceProps_, deviceId);
     if (status != cudaSuccess)
     {
-        errMessage = "cudaStreamCreateWithFlags failed";
-        stream_ = nullptr;
+        errMessage = "cudaGetDeviceProperties failed";
+        return false;
+    }
+
+    archTag_ =
+        word
+        (
+            "compute_"
+          + Foam::name(deviceProps_.major)
+          + Foam::name(deviceProps_.minor)
+        );
+
+    status = ::cudaStreamCreateWithFlags(&computeStream_, cudaStreamNonBlocking);
+    if (status != cudaSuccess)
+    {
+        errMessage = "cudaStreamCreateWithFlags (compute) failed";
+        computeStream_ = nullptr;
+        return false;
+    }
+
+    status = ::cudaStreamCreateWithFlags(&transferStream_, cudaStreamNonBlocking);
+    if (status != cudaSuccess)
+    {
+        errMessage = "cudaStreamCreateWithFlags (transfer) failed";
+        ::cudaStreamDestroy(computeStream_);
+        computeStream_ = nullptr;
+        transferStream_ = nullptr;
+        return false;
+    }
+
+    status = ::cudaStreamCreateWithFlags(&auxStream_, cudaStreamNonBlocking);
+    if (status != cudaSuccess)
+    {
+        errMessage = "cudaStreamCreateWithFlags (aux) failed";
+        ::cudaStreamDestroy(computeStream_);
+        ::cudaStreamDestroy(transferStream_);
+        computeStream_ = nullptr;
+        transferStream_ = nullptr;
+        auxStream_ = nullptr;
         return false;
     }
 
@@ -80,13 +121,25 @@ void Context::reset()
 #ifdef FOAM_USE_CUDA
     if (initialised_)
     {
-        if (stream_)
+        if (computeStream_)
         {
-            ::cudaStreamDestroy(stream_);
-            stream_ = nullptr;
+            ::cudaStreamDestroy(computeStream_);
+            computeStream_ = nullptr;
+        }
+        if (transferStream_)
+        {
+            ::cudaStreamDestroy(transferStream_);
+            transferStream_ = nullptr;
+        }
+        if (auxStream_)
+        {
+            ::cudaStreamDestroy(auxStream_);
+            auxStream_ = nullptr;
         }
         initialised_ = false;
         deviceId_ = -1;
+        archTag_.clear();
+        deviceProps_ = cudaDeviceProp{};
     }
 #endif
 }
@@ -115,7 +168,79 @@ int Context::deviceId() const
 cudaStream_t Context::stream() const
 {
 #ifdef FOAM_USE_CUDA
-    return stream_;
+    return computeStream_;
+#else
+    return nullptr;
+#endif
+}
+
+
+cudaStream_t Context::computeStream() const
+{
+#ifdef FOAM_USE_CUDA
+    return computeStream_;
+#else
+    return nullptr;
+#endif
+}
+
+
+cudaStream_t Context::transferStream() const
+{
+#ifdef FOAM_USE_CUDA
+    return transferStream_;
+#else
+    return nullptr;
+#endif
+}
+
+
+cudaStream_t Context::auxStream() const
+{
+#ifdef FOAM_USE_CUDA
+    return auxStream_;
+#else
+    return nullptr;
+#endif
+}
+
+
+const cudaDeviceProp& Context::deviceProperties() const
+{
+#ifdef FOAM_USE_CUDA
+    return deviceProps_;
+#else
+    static cudaDeviceProp dummy{};
+    return dummy;
+#endif
+}
+
+
+const word& Context::architectureTag() const
+{
+#ifdef FOAM_USE_CUDA
+    return archTag_;
+#else
+    static const word empty;
+    return empty;
+#endif
+}
+
+
+int Context::capabilityMajor() const
+{
+#ifdef FOAM_USE_CUDA
+    return initialised_ ? deviceProps_.major : -1;
+#else
+    return -1;
+#endif
+}
+
+
+int Context::capabilityMinor() const
+{
+#ifdef FOAM_USE_CUDA
+    return initialised_ ? deviceProps_.minor : -1;
 #else
     return nullptr;
 #endif

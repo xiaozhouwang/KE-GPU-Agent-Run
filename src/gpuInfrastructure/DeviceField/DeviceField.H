@@ -5,6 +5,7 @@
 #include "fvMesh.H"
 #include "MeshObject.H"
 #include "word.H"
+#include "pTraits.H"
 
 #include <memory>
 #include <unordered_map>
@@ -41,12 +42,16 @@ class DeviceField
 #ifdef FOAM_USE_CUDA
     ValueType* devicePtr_;
     label count_;
+    typename pTraits<ValueType>::cmptType* soaPtr_;
+    label soaCount_;
+    bool soaValid_;
 #endif
 
     bool hostDirty_;
     bool deviceDirty_;
 
     bool allocate(Context& ctx, word& err);
+    void freeSoA();
 
 public:
 
@@ -66,6 +71,16 @@ public:
 
     void markHostDirty();
     void markDeviceDirty();
+
+    //- Return true when a SoA layout can be produced for this field.
+    bool supportsSoA() const;
+
+    //- Ensure the SoA layout is up to date on the device. Returns true on success.
+    bool ensureSoALayout(Context& ctx, word& error);
+
+    //- Access the SoA device pointer (nullptr if unavailable).
+    typename pTraits<ValueType>::cmptType* soaPointer();
+    const typename pTraits<ValueType>::cmptType* soaPointer() const;
 };
 
 

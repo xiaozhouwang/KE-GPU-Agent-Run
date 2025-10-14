@@ -12,13 +12,15 @@
 #include "correctedSnGrad.H"
 #include "IStringStream.H"
 #include "surfaceInterpolate.H"
+#include "localEulerDdtScheme.H"
+#include "fvmLaplacian.H"
 #include "fvMesh.H"
 #include "fvMatrices.H"
 #include "Time.H"
 #include "pTraits.H"
+#include "KernelCache.H"
 
 #include <sstream>
-#include <map>
 
 #ifdef FOAM_USE_CUDA
     #include <cuda.h>
@@ -37,52 +39,14 @@ namespace fvm
 namespace
 {
 
-std::string nvrtcErrorString(const nvrtcResult code)
+word makeEulerDdtKey(const int components)
 {
-    return std::string(nvrtcGetErrorString(code))
-        + " (" + Foam::name(static_cast<int>(code)) + ')';
+    return word("assembleEulerDdt_" + Foam::name(components));
 }
 
 
-std::string cudaDriverErrorString(const CUresult code)
+std::string makeEulerDdtSource(const int components)
 {
-    const char* msg = nullptr;
-    cuGetErrorString(code, &msg);
-    if (msg)
-    {
-        return std::string(msg)
-            + " (" + Foam::name(static_cast<int>(code)) + ')';
-    }
-    return "cuda driver error (" + Foam::name(static_cast<int>(code)) + ')';
-}
-
-
-struct KernelEntry
-{
-    CUmodule module{nullptr};
-    CUfunction function{nullptr};
-};
-
-
-bool compileEulerDdtKernel
-(
-    const int components,
-    CUmodule& module,
-    CUfunction& function,
-    word& error
-)
-{
-    static std::map<int, KernelEntry> cache;
-
-    const auto iter = cache.find(components);
-    if (iter != cache.end())
-    {
-        module = iter->second.module;
-        function = iter->second.function;
-        error.clear();
-        return module != nullptr && function != nullptr;
-    }
-
     std::ostringstream source;
     source
         << "#define COMPONENTS " << components << '\n'
@@ -92,8 +56,8 @@ bool compileEulerDdtKernel
         << "    double* source,\n"
         << "    const double* volumeDiag,\n"
         << "    const double* volumeSource,\n"
+        << "    const double* rDeltaT,\n"
         << "    const double* fieldOld,\n"
-        << "    const double rDeltaT,\n"
         << "    const int nCells)\n"
         << "{\n"
         << "    const int cell = blockIdx.x * blockDim.x + threadIdx.x;\n"
@@ -101,9 +65,10 @@ bool compileEulerDdtKernel
         << "    {\n"
         << "        return;\n"
         << "    }\n"
-        << "    const double diagVal = rDeltaT * volumeDiag[cell];\n"
+        << "    const double rDeltaTCell = rDeltaT[cell];\n"
+        << "    const double diagVal = rDeltaTCell * volumeDiag[cell];\n"
         << "    diag[cell] = diagVal;\n"
-        << "    const double coeff = rDeltaT * volumeSource[cell];\n"
+        << "    const double coeff = rDeltaTCell * volumeSource[cell];\n"
         << "    const double* uOld = fieldOld + cell*COMPONENTS;\n"
         << "    double* src = source + cell*COMPONENTS;\n"
         << "    #pragma unroll\n"
@@ -112,108 +77,13 @@ bool compileEulerDdtKernel
         << "        src[c] = coeff * uOld[c];\n"
         << "    }\n"
         << "}\n";
-
-    nvrtcProgram prog;
-    nvrtcResult nvStatus = nvrtcCreateProgram
-    (
-        &prog,
-        source.str().c_str(),
-        "assembleEulerDdt.cu",
-        0,
-        nullptr,
-        nullptr
-    );
-
-    if (nvStatus != NVRTC_SUCCESS)
-    {
-        error = "nvrtcCreateProgram failed: " + nvrtcErrorString(nvStatus);
-        return false;
-    }
-
-    int deviceId = 0;
-    cudaGetDevice(&deviceId);
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, deviceId);
-
-    std::ostringstream arch;
-    arch<< "--gpu-architecture=compute_" << prop.major << prop.minor;
-    const std::string archStr = arch.str();
-    const char* options[] = { "--std=c++14", archStr.c_str() };
-    nvStatus = nvrtcCompileProgram(prog, 2, options);
-
-    if (nvStatus != NVRTC_SUCCESS)
-    {
-        size_t logSize = 0;
-        nvrtcGetProgramLogSize(prog, &logSize);
-        std::string log(logSize, '\0');
-        if (logSize > 1)
-        {
-            nvrtcGetProgramLog(prog, &log[0]);
-        }
-
-        error = "nvrtcCompileProgram failed: " + nvrtcErrorString(nvStatus);
-        if (!log.empty())
-        {
-            error += " :: " + log;
-        }
-        nvrtcDestroyProgram(&prog);
-        return false;
-    }
-
-    size_t ptxSize = 0;
-    nvrtcGetPTXSize(prog, &ptxSize);
-    std::string ptx(ptxSize, '\0');
-    nvrtcGetPTX(prog, &ptx[0]);
-    nvrtcDestroyProgram(&prog);
-
-    KernelEntry entry;
-
-    CUresult cuStatus = cuModuleLoadData(&entry.module, ptx.c_str());
-    if (cuStatus != CUDA_SUCCESS)
-    {
-        error = "cuModuleLoadData failed: " + cudaDriverErrorString(cuStatus);
-        return false;
-    }
-
-    cuStatus = cuModuleGetFunction
-    (
-        &entry.function,
-        entry.module,
-        "assembleEulerDdt"
-    );
-
-    if (cuStatus != CUDA_SUCCESS)
-    {
-        error = "cuModuleGetFunction failed: " + cudaDriverErrorString(cuStatus);
-        cuModuleUnload(entry.module);
-        entry = KernelEntry{};
-        return false;
-    }
-
-    cache.emplace(components, entry);
-    module = entry.module;
-    function = entry.function;
-    error.clear();
-    return true;
+    return source.str();
 }
 
 
-bool compileGaussDivKernel(CUmodule& module, CUfunction& function, word& error)
+const std::string& gaussDivSource()
 {
-    static bool initialised = false;
-    static KernelEntry cache;
-
-    if (initialised)
-    {
-        module = cache.module;
-        function = cache.function;
-        error.clear();
-        return cache.module != nullptr && cache.function != nullptr;
-    }
-
-    initialised = true;
-
-    const char* source = R"(
+    static const std::string src = R"(
 extern "C" __global__
 void assembleGaussDiv(double* lower, double* upper, const double* faceFlux, int nFaces)
 {
@@ -231,110 +101,13 @@ void assembleGaussDiv(double* lower, double* upper, const double* faceFlux, int 
     upper[face] = upperVal;
 }
 )";
-
-    nvrtcProgram prog;
-    nvrtcResult nvStatus = nvrtcCreateProgram
-    (
-        &prog,
-        source,
-        "assembleGaussDiv.cu",
-        0,
-        nullptr,
-        nullptr
-    );
-
-    if (nvStatus != NVRTC_SUCCESS)
-    {
-        error = "nvrtcCreateProgram failed: " + nvrtcErrorString(nvStatus);
-        return false;
-    }
-
-    int deviceId = 0;
-    cudaGetDevice(&deviceId);
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, deviceId);
-
-    std::ostringstream arch;
-    arch<< "--gpu-architecture=compute_" << prop.major << prop.minor;
-    const std::string archStr = arch.str();
-    const char* options[] = { "--std=c++14", archStr.c_str() };
-    nvStatus = nvrtcCompileProgram(prog, 2, options);
-
-    if (nvStatus != NVRTC_SUCCESS)
-    {
-        size_t logSize = 0;
-        nvrtcGetProgramLogSize(prog, &logSize);
-        std::string log(logSize, '\0');
-        if (logSize > 1)
-        {
-            nvrtcGetProgramLog(prog, &log[0]);
-        }
-
-        error = "nvrtcCompileProgram failed: " + nvrtcErrorString(nvStatus);
-        if (!log.empty())
-        {
-            error += " :: " + log;
-        }
-        nvrtcDestroyProgram(&prog);
-        return false;
-    }
-
-    size_t ptxSize = 0;
-    nvrtcGetPTXSize(prog, &ptxSize);
-    std::string ptx(ptxSize, '\0');
-    nvrtcGetPTX(prog, &ptx[0]);
-    nvrtcDestroyProgram(&prog);
-
-    CUresult cuStatus = cuModuleLoadData(&cache.module, ptx.c_str());
-    if (cuStatus != CUDA_SUCCESS)
-    {
-        error = "cuModuleLoadData failed: " + cudaDriverErrorString(cuStatus);
-        cache = KernelEntry{};
-        return false;
-    }
-
-    cuStatus = cuModuleGetFunction
-    (
-        &cache.function,
-        cache.module,
-        "assembleGaussDiv"
-    );
-
-    if (cuStatus != CUDA_SUCCESS)
-    {
-        error = "cuModuleGetFunction failed: " + cudaDriverErrorString(cuStatus);
-        cuModuleUnload(cache.module);
-        cache = KernelEntry{};
-        return false;
-    }
-
-    module = cache.module;
-    function = cache.function;
-    error.clear();
-    return true;
+    return src;
 }
 
-bool compileGaussLaplacianKernel
-(
-    CUmodule& module,
-    CUfunction& function,
-    word& error
-)
+
+const std::string& gaussLaplacianSource()
 {
-    static bool initialised = false;
-    static KernelEntry cache;
-
-    if (initialised)
-    {
-        module = cache.module;
-        function = cache.function;
-        error.clear();
-        return cache.module != nullptr && cache.function != nullptr;
-    }
-
-    initialised = true;
-
-    const char* source = R"(
+    static const std::string src = R"(
 extern "C" __global__
 void assembleGaussLaplacian(double* upper, const double* gammaMagSf, const double* deltaCoeffs, int nFaces)
 {
@@ -347,88 +120,9 @@ void assembleGaussLaplacian(double* upper, const double* gammaMagSf, const doubl
     upper[face] = gammaMagSf[face]*deltaCoeffs[face];
 }
 )";
-
-    nvrtcProgram prog;
-    nvrtcResult nvStatus = nvrtcCreateProgram
-    (
-        &prog,
-        source,
-        "assembleGaussLaplacian.cu",
-        0,
-        nullptr,
-        nullptr
-    );
-
-    if (nvStatus != NVRTC_SUCCESS)
-    {
-        error = "nvrtcCreateProgram failed: " + nvrtcErrorString(nvStatus);
-        return false;
-    }
-
-    int deviceId = 0;
-    cudaGetDevice(&deviceId);
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, deviceId);
-
-    std::ostringstream arch;
-    arch<< "--gpu-architecture=compute_" << prop.major << prop.minor;
-    const std::string archStr = arch.str();
-    const char* options[] = { "--std=c++14", archStr.c_str() };
-    nvStatus = nvrtcCompileProgram(prog, 2, options);
-
-    if (nvStatus != NVRTC_SUCCESS)
-    {
-        size_t logSize = 0;
-        nvrtcGetProgramLogSize(prog, &logSize);
-        std::string log(logSize, '\0');
-        if (logSize > 1)
-        {
-            nvrtcGetProgramLog(prog, &log[0]);
-        }
-
-        error = "nvrtcCompileProgram failed: " + nvrtcErrorString(nvStatus);
-        if (!log.empty())
-        {
-            error += " :: " + log;
-        }
-        nvrtcDestroyProgram(&prog);
-        return false;
-    }
-
-    size_t ptxSize = 0;
-    nvrtcGetPTXSize(prog, &ptxSize);
-    std::string ptx(ptxSize, '\0');
-    nvrtcGetPTX(prog, &ptx[0]);
-    nvrtcDestroyProgram(&prog);
-
-    CUresult cuStatus = cuModuleLoadData(&cache.module, ptx.c_str());
-    if (cuStatus != CUDA_SUCCESS)
-    {
-        error = "cuModuleLoadData failed: " + cudaDriverErrorString(cuStatus);
-        cache = KernelEntry{};
-        return false;
-    }
-
-    cuStatus = cuModuleGetFunction
-    (
-        &cache.function,
-        cache.module,
-        "assembleGaussLaplacian"
-    );
-
-    if (cuStatus != CUDA_SUCCESS)
-    {
-        error = "cuModuleGetFunction failed: " + cudaDriverErrorString(cuStatus);
-        cuModuleUnload(cache.module);
-        cache = KernelEntry{};
-        return false;
-    }
-
-    module = cache.module;
-    function = cache.function;
-    error.clear();
-    return true;
+    return src;
 }
+
 
 class DeviceBuffer
 {
@@ -618,6 +312,10 @@ tmp<fvMatrix<Type>> ddt
     DeviceField<GeometricField<Type, fvPatchField, volMesh>>& vfOldDevice =
         *vfOldDevicePtr;
 
+    // Ensure the old-time field values are uploaded for this step since
+    // OpenFOAM rotates them on the host each time step.
+    vfOldDevice.markHostDirty();
+
     if (!vfDevice.syncHostToDevice(ctx, error))
     {
         return tmp<fvMatrix<Type>>();
@@ -649,15 +347,26 @@ tmp<fvMatrix<Type>> ddt
         return tfvm;
     }
 
-    const scalar rDeltaT = 1.0/mesh.time().deltaTValue();
     const scalarField& volumeDiag = mesh.Vsc();
     const scalarField& volumeSource =
         mesh.moving() ? mesh.Vsc0() : mesh.Vsc();
+
+    scalarField rDeltaTHost
+    (
+        volumeDiag.size(),
+        1.0/mesh.time().deltaTValue()
+    );
+
+    if (fv::localEulerDdt::enabled(mesh))
+    {
+        rDeltaTHost = fv::localEulerDdt::localRDeltaT(mesh).primitiveField();
+    }
 
     DeviceBuffer diagDev;
     DeviceBuffer sourceDev;
     DeviceBuffer volDiagDev;
     DeviceBuffer volSrcDev;
+    DeviceBuffer rDeltaTDev;
 
     const std::size_t diagBytes = sizeof(scalar)*nCells;
     const std::size_t nComp = pTraits<Type>::nComponents;
@@ -669,43 +378,66 @@ tmp<fvMatrix<Type>> ddt
      || !sourceDev.allocate(sourceBytes, error)
      || !volDiagDev.allocate(diagBytes, error)
      || !volSrcDev.allocate(diagBytes, error)
+     || !rDeltaTDev.allocate(diagBytes, error)
     )
     {
         return tmp<fvMatrix<Type>>();
     }
 
-    if (cudaMemcpy
+    if
+    (
+        cudaMemcpyAsync
         (
             volDiagDev.as<scalar>(),
             volumeDiag.begin(),
             diagBytes,
-            cudaMemcpyHostToDevice
-        ) != cudaSuccess)
+            cudaMemcpyHostToDevice,
+            ctx.transferStream()
+        ) != cudaSuccess
+    )
     {
-        error = "cudaMemcpy(volDiag host->device) failed";
+        error = "cudaMemcpyAsync(volDiag host->device) failed";
         return tmp<fvMatrix<Type>>();
     }
 
-    if (cudaMemcpy
+    if
+    (
+        cudaMemcpyAsync
         (
             volSrcDev.as<scalar>(),
             volumeSource.begin(),
             diagBytes,
-            cudaMemcpyHostToDevice
-        ) != cudaSuccess)
+            cudaMemcpyHostToDevice,
+            ctx.transferStream()
+        ) != cudaSuccess
+    )
     {
-        error = "cudaMemcpy(volSrc host->device) failed";
+        error = "cudaMemcpyAsync(volSrc host->device) failed";
         return tmp<fvMatrix<Type>>();
     }
 
-    CUmodule module = nullptr;
-    CUfunction function = nullptr;
+    if
+    (
+        cudaMemcpyAsync
+        (
+            rDeltaTDev.as<scalar>(),
+            rDeltaTHost.begin(),
+            diagBytes,
+            cudaMemcpyHostToDevice,
+            ctx.transferStream()
+        ) != cudaSuccess
+    )
+    {
+        error = "cudaMemcpyAsync(rDeltaT host->device) failed";
+        return tmp<fvMatrix<Type>>();
+    }
 
     if
     (
-        !compileEulerDdtKernel(static_cast<int>(nComp), module, function, error)
+        cudaStreamSynchronize(ctx.transferStream()) != cudaSuccess
     )
     {
+        error = "cudaStreamSynchronize(volCoeff host->device) failed";
         return tmp<fvMatrix<Type>>();
     }
 
@@ -713,6 +445,7 @@ tmp<fvMatrix<Type>> ddt
     scalar* sourcePtr = reinterpret_cast<scalar*>(sourceDev.get());
     scalar* volDiagPtr = reinterpret_cast<scalar*>(volDiagDev.get());
     scalar* volSrcPtr = reinterpret_cast<scalar*>(volSrcDev.get());
+    scalar* rDeltaTPtr = reinterpret_cast<scalar*>(rDeltaTDev.get());
 
     scalar* vfOldPtr = reinterpret_cast<scalar*>
     (
@@ -728,7 +461,6 @@ tmp<fvMatrix<Type>> ddt
     const unsigned int blockSize = 256;
     const unsigned int gridSize = (nCells + blockSize - 1)/blockSize;
 
-    scalar coeff = rDeltaT;
     int cells = static_cast<int>(nCells);
 
     void* args[] =
@@ -737,93 +469,134 @@ tmp<fvMatrix<Type>> ddt
         &sourcePtr,
         &volDiagPtr,
         &volSrcPtr,
+        &rDeltaTPtr,
         &vfOldPtr,
-        &coeff,
         &cells
     };
 
-    cudaEvent_t startEvent = nullptr;
-    cudaEvent_t stopEvent = nullptr;
+    const int components = static_cast<int>(nComp);
+    const word kernelKey = makeEulerDdtKey(components);
+    const std::string kernelSource = makeEulerDdtSource(components);
 
-    if (stats)
+    CompiledKernel kernel;
+    if
+    (
+        !KernelCache::instance().getOrCompile
+        (
+            ctx,
+            kernelKey,
+            kernelSource,
+            {},
+            "assembleEulerDdt",
+            kernel,
+            error
+        )
+    )
     {
-        cudaEventCreateWithFlags(&startEvent, cudaEventDefault);
-        cudaEventCreateWithFlags(&stopEvent, cudaEventDefault);
-        cudaEventRecord(startEvent, ctx.stream());
+        return tmp<fvMatrix<Type>>();
     }
 
-    CUresult launchStatus = cuLaunchKernel
-    (
-        function,
-        gridSize, 1, 1,
-        blockSize, 1, 1,
-        0,
-        reinterpret_cast<CUstream>(ctx.stream()),
-        args,
-        nullptr
-    );
+    scalar elapsedMs = 0;
 
-    if (launchStatus != CUDA_SUCCESS)
+    if
+    (
+        !GraphLaunchCache::instance().launch
+        (
+            ctx,
+            kernelKey,
+            kernel,
+            StreamCategory::compute,
+            dim3(gridSize, 1, 1),
+            dim3(blockSize, 1, 1),
+            args,
+            sizeof(args)/sizeof(args[0]),
+            0,
+            error,
+            stats != nullptr,
+            elapsedMs
+        )
+    )
     {
-        error = "cuLaunchKernel(assembleEulerDdt) failed: "
-            + cudaDriverErrorString(launchStatus);
         return tmp<fvMatrix<Type>>();
     }
 
     if (stats)
     {
-        cudaEventRecord(stopEvent, ctx.stream());
-        cudaEventSynchronize(stopEvent);
-
-        float ms = 0.0f;
-        cudaEventElapsedTime(&ms, startEvent, stopEvent);
-        stats->gpuMilliseconds = static_cast<scalar>(ms);
-        cudaEventDestroy(startEvent);
-        cudaEventDestroy(stopEvent);
+        stats->gpuMilliseconds = elapsedMs;
     }
-    else
+
+    cudaEvent_t kernelDone = nullptr;
+    if (cudaEventCreateWithFlags(&kernelDone, cudaEventDisableTiming) != cudaSuccess)
     {
-        launchStatus = cuStreamSynchronize
-        (
-            reinterpret_cast<CUstream>(ctx.stream())
-        );
-
-        if (launchStatus != CUDA_SUCCESS)
-        {
-            error = "cuStreamSynchronize failed: "
-              + cudaDriverErrorString(launchStatus);
-            return tmp<fvMatrix<Type>>();
-        }
+        error = "cudaEventCreate(kernelDone) failed";
+        return tmp<fvMatrix<Type>>();
     }
+
+    if (cudaEventRecord(kernelDone, ctx.computeStream()) != cudaSuccess)
+    {
+        cudaEventDestroy(kernelDone);
+        error = "cudaEventRecord(kernelDone) failed";
+        return tmp<fvMatrix<Type>>();
+    }
+
+    if (cudaStreamWaitEvent(ctx.transferStream(), kernelDone, 0) != cudaSuccess)
+    {
+        cudaEventDestroy(kernelDone);
+        error = "cudaStreamWaitEvent(kernelDone) failed";
+        return tmp<fvMatrix<Type>>();
+    }
+
+    bool copyOk = true;
 
     if
     (
-        cudaMemcpy
+        cudaMemcpyAsync
         (
             diag.begin(),
             diagPtr,
             diagBytes,
-            cudaMemcpyDeviceToHost
+            cudaMemcpyDeviceToHost,
+            ctx.transferStream()
         ) != cudaSuccess
     )
     {
-        error = "cudaMemcpy(diag device->host) failed";
-        return tmp<fvMatrix<Type>>();
+        error = "cudaMemcpyAsync(diag device->host) failed";
+        copyOk = false;
     }
 
     scalar* sourceHost = reinterpret_cast<scalar*>(source.begin());
+    if (copyOk)
+    {
+        if
+        (
+            cudaMemcpyAsync
+            (
+                sourceHost,
+                sourcePtr,
+                sourceBytes,
+                cudaMemcpyDeviceToHost,
+                ctx.transferStream()
+            ) != cudaSuccess
+        )
+        {
+            error = "cudaMemcpyAsync(source device->host) failed";
+            copyOk = false;
+        }
+    }
+
+    cudaEventDestroy(kernelDone);
+
+    if (!copyOk)
+    {
+        return tmp<fvMatrix<Type>>();
+    }
+
     if
     (
-        cudaMemcpy
-        (
-            sourceHost,
-            sourcePtr,
-            sourceBytes,
-            cudaMemcpyDeviceToHost
-        ) != cudaSuccess
+        cudaStreamSynchronize(ctx.transferStream()) != cudaSuccess
     )
     {
-        error = "cudaMemcpy(source device->host) failed";
+        error = "cudaStreamSynchronize(ddt copies) failed";
         return tmp<fvMatrix<Type>>();
     }
 
@@ -930,6 +703,8 @@ tmp<fvMatrix<Type>> laplacian
 
     const label nFaces = mesh.nInternalFaces();
 
+    bool copiedUpper = false;
+
     if (nFaces)
     {
         DeviceBuffer gammaDev;
@@ -950,39 +725,42 @@ tmp<fvMatrix<Type>> laplacian
 
         if
         (
-            cudaMemcpy
+            cudaMemcpyAsync
             (
                 gammaDev.get(),
                 gammaMagSf.primitiveField().begin(),
                 bytes,
-                cudaMemcpyHostToDevice
+                cudaMemcpyHostToDevice,
+                ctx.transferStream()
             ) != cudaSuccess
         )
         {
-            error = "cudaMemcpy(gammaMagSf host->device) failed";
+            error = "cudaMemcpyAsync(gammaMagSf host->device) failed";
             return tmp<fvMatrix<Type>>();
         }
 
         if
         (
-            cudaMemcpy
+            cudaMemcpyAsync
             (
                 deltaDev.get(),
                 deltaCoeffsRef.primitiveField().begin(),
                 bytes,
-                cudaMemcpyHostToDevice
+                cudaMemcpyHostToDevice,
+                ctx.transferStream()
             ) != cudaSuccess
         )
         {
-            error = "cudaMemcpy(deltaCoeffs host->device) failed";
+            error = "cudaMemcpyAsync(deltaCoeffs host->device) failed";
             return tmp<fvMatrix<Type>>();
         }
 
-        CUmodule module = nullptr;
-        CUfunction function = nullptr;
-
-        if (!compileGaussLaplacianKernel(module, function, error))
+        if
+        (
+            cudaStreamSynchronize(ctx.transferStream()) != cudaSuccess
+        )
         {
+            error = "cudaStreamSynchronize(Laplacian coeff copies) failed";
             return tmp<fvMatrix<Type>>();
         }
 
@@ -993,74 +771,113 @@ tmp<fvMatrix<Type>> laplacian
         int faces = static_cast<int>(nFaces);
         void* args[] = { &upperPtr, &gammaPtr, &deltaPtr, &faces };
 
-        cudaEvent_t startEvent = nullptr;
-        cudaEvent_t stopEvent = nullptr;
+        static const word kernelKey("assembleGaussLaplacian");
 
-        if (stats)
+        CompiledKernel kernel;
+        if
+        (
+            !KernelCache::instance().getOrCompile
+            (
+                ctx,
+                kernelKey,
+                gaussLaplacianSource(),
+                {},
+                "assembleGaussLaplacian",
+                kernel,
+                error
+            )
+        )
         {
-            cudaEventCreateWithFlags(&startEvent, cudaEventDefault);
-            cudaEventCreateWithFlags(&stopEvent, cudaEventDefault);
-            cudaEventRecord(startEvent, ctx.stream());
+            return tmp<fvMatrix<Type>>();
         }
 
-        CUresult launchStatus = cuLaunchKernel
-        (
-            function,
-            (faces + 255)/256, 1, 1,
-            256, 1, 1,
-            0,
-            reinterpret_cast<CUstream>(ctx.stream()),
-            args,
-            nullptr
-        );
+        scalar elapsedMs = 0;
 
-        if (launchStatus != CUDA_SUCCESS)
+        if
+        (
+            !GraphLaunchCache::instance().launch
+            (
+                ctx,
+                kernelKey,
+                kernel,
+                StreamCategory::compute,
+                dim3((faces + 255)/256, 1, 1),
+                dim3(256, 1, 1),
+                args,
+                sizeof(args)/sizeof(args[0]),
+                0,
+                error,
+                stats != nullptr,
+                elapsedMs
+            )
+        )
         {
-            error = "cuLaunchKernel(assembleGaussLaplacian) failed: "
-              + cudaDriverErrorString(launchStatus);
             return tmp<fvMatrix<Type>>();
         }
 
         if (stats)
         {
-            cudaEventRecord(stopEvent, ctx.stream());
-            cudaEventSynchronize(stopEvent);
-
-            float ms = 0.0f;
-            cudaEventElapsedTime(&ms, startEvent, stopEvent);
-            stats->gpuMilliseconds = static_cast<scalar>(ms);
-            cudaEventDestroy(startEvent);
-            cudaEventDestroy(stopEvent);
+            stats->gpuMilliseconds = elapsedMs;
         }
-        else
+
+        cudaEvent_t kernelDone = nullptr;
+        if (cudaEventCreateWithFlags(&kernelDone, cudaEventDisableTiming) != cudaSuccess)
         {
-            launchStatus = cuStreamSynchronize
-            (
-                reinterpret_cast<CUstream>(ctx.stream())
-            );
-
-            if (launchStatus != CUDA_SUCCESS)
-            {
-                error = "cuStreamSynchronize failed: "
-                  + cudaDriverErrorString(launchStatus);
-                return tmp<fvMatrix<Type>>();
-            }
+            error = "cudaEventCreate(laplacian kernel) failed";
+            return tmp<fvMatrix<Type>>();
         }
+
+        if (cudaEventRecord(kernelDone, ctx.computeStream()) != cudaSuccess)
+        {
+            cudaEventDestroy(kernelDone);
+            error = "cudaEventRecord(laplacian kernel) failed";
+            return tmp<fvMatrix<Type>>();
+        }
+
+        if (cudaStreamWaitEvent(ctx.transferStream(), kernelDone, 0) != cudaSuccess)
+        {
+            cudaEventDestroy(kernelDone);
+            error = "cudaStreamWaitEvent(laplacian kernel) failed";
+            return tmp<fvMatrix<Type>>();
+        }
+
+        bool copyOk = true;
 
         if
         (
-            cudaMemcpy
+            cudaMemcpyAsync
             (
                 upper.begin(),
                 upperDev.get(),
                 bytes,
-                cudaMemcpyDeviceToHost
+                cudaMemcpyDeviceToHost,
+                ctx.transferStream()
             ) != cudaSuccess
         )
         {
-            error = "cudaMemcpy(upper device->host) failed";
+            error = "cudaMemcpyAsync(upper device->host) failed";
+            copyOk = false;
+        }
+
+        if (!copyOk)
+        {
+            cudaEventDestroy(kernelDone);
             return tmp<fvMatrix<Type>>();
         }
+
+        if
+        (
+            cudaStreamSynchronize(ctx.transferStream()) != cudaSuccess
+        )
+        {
+            cudaEventDestroy(kernelDone);
+            error = "cudaStreamSynchronize(laplacian copies) failed";
+            return tmp<fvMatrix<Type>>();
+        }
+
+        cudaEventDestroy(kernelDone);
+
+        copiedUpper = true;
     }
     else if (stats)
     {
@@ -1119,6 +936,25 @@ tmp<fvMatrix<Type>> laplacian
     if (mesh.schemes().fluxRequired(vf.name()))
     {
         mat.faceFluxCorrectionPtr() = tFaceFluxCorrection.ptr();
+    }
+
+    if (stats)
+    {
+        tmp<fvMatrix<Type>> tCpuLapCheck = Foam::fvm::laplacian(gamma, vf);
+        const scalarField& gpuSrc = mat.source();
+        const scalarField& cpuSrc = tCpuLapCheck().source();
+        scalar diffSq = 0.0;
+        scalar refSq = 0.0;
+        forAll(gpuSrc, celli)
+        {
+            const scalar diff = gpuSrc[celli] - cpuSrc[celli];
+            const scalar w = mesh.V()[celli];
+            diffSq += w*diff*diff;
+            refSq += w*cpuSrc[celli]*cpuSrc[celli];
+        }
+        refSq = max(refSq, VSMALL);
+        Info<< "GPU laplacian source mismatch (pre-solve): "
+            << Foam::sqrt(diffSq/refSq) << nl;
     }
 
     usedGpu = true;
@@ -1190,6 +1026,8 @@ tmp<fvMatrix<Type>> div
 
     const label nFaces = mesh.nInternalFaces();
 
+    bool copiedCoeffs = false;
+
     if (nFaces)
     {
         DeviceField<surfaceScalarField>& fluxDev =
@@ -1212,14 +1050,6 @@ tmp<fvMatrix<Type>> div
             return tmp<fvMatrix<Type>>();
         }
 
-        CUmodule module = nullptr;
-        CUfunction function = nullptr;
-
-        if (!compileGaussDivKernel(module, function, error))
-        {
-            return tmp<fvMatrix<Type>>();
-        }
-
         double* lowerPtr = reinterpret_cast<double*>(lowerDev.get());
         double* upperPtr = reinterpret_cast<double*>(upperDev.get());
         double* fluxPtr = reinterpret_cast<double*>(fluxDev.devicePointer());
@@ -1233,89 +1063,133 @@ tmp<fvMatrix<Type>> div
         int faces = static_cast<int>(nFaces);
         void* args[] = { &lowerPtr, &upperPtr, &fluxPtr, &faces };
 
-        cudaEvent_t startEvent = nullptr;
-        cudaEvent_t stopEvent = nullptr;
+        static const word kernelKey("assembleGaussDiv");
 
-        if (stats)
+        CompiledKernel kernel;
+        if
+        (
+            !KernelCache::instance().getOrCompile
+            (
+                ctx,
+                kernelKey,
+                gaussDivSource(),
+                {},
+                "assembleGaussDiv",
+                kernel,
+                error
+            )
+        )
         {
-            cudaEventCreateWithFlags(&startEvent, cudaEventDefault);
-            cudaEventCreateWithFlags(&stopEvent, cudaEventDefault);
-            cudaEventRecord(startEvent, ctx.stream());
+            return tmp<fvMatrix<Type>>();
         }
 
-        CUresult launchStatus = cuLaunchKernel
-        (
-            function,
-            (faces + 255)/256, 1, 1,
-            256, 1, 1,
-            0,
-            reinterpret_cast<CUstream>(ctx.stream()),
-            args,
-            nullptr
-        );
+        scalar elapsedMs = 0;
 
-        if (launchStatus != CUDA_SUCCESS)
+        if
+        (
+            !GraphLaunchCache::instance().launch
+            (
+                ctx,
+                kernelKey,
+                kernel,
+                StreamCategory::compute,
+                dim3((faces + 255)/256, 1, 1),
+                dim3(256, 1, 1),
+                args,
+                sizeof(args)/sizeof(args[0]),
+                0,
+                error,
+                stats != nullptr,
+                elapsedMs
+            )
+        )
         {
-            error = "cuLaunchKernel(assembleGaussDiv) failed: "
-              + cudaDriverErrorString(launchStatus);
             return tmp<fvMatrix<Type>>();
         }
 
         if (stats)
         {
-            cudaEventRecord(stopEvent, ctx.stream());
-            cudaEventSynchronize(stopEvent);
-
-            float ms = 0.0f;
-            cudaEventElapsedTime(&ms, startEvent, stopEvent);
-            stats->gpuMilliseconds = static_cast<scalar>(ms);
-            cudaEventDestroy(startEvent);
-            cudaEventDestroy(stopEvent);
+            stats->gpuMilliseconds = elapsedMs;
         }
-        else
+
+        cudaEvent_t kernelDone = nullptr;
+        if (cudaEventCreateWithFlags(&kernelDone, cudaEventDisableTiming) != cudaSuccess)
         {
-            launchStatus = cuStreamSynchronize
-            (
-                reinterpret_cast<CUstream>(ctx.stream())
-            );
-
-            if (launchStatus != CUDA_SUCCESS)
-            {
-                error = "cuStreamSynchronize failed: "
-                  + cudaDriverErrorString(launchStatus);
-                return tmp<fvMatrix<Type>>();
-            }
+            error = "cudaEventCreate(div kernel) failed";
+            return tmp<fvMatrix<Type>>();
         }
+
+        if (cudaEventRecord(kernelDone, ctx.computeStream()) != cudaSuccess)
+        {
+            cudaEventDestroy(kernelDone);
+            error = "cudaEventRecord(div kernel) failed";
+            return tmp<fvMatrix<Type>>();
+        }
+
+        if (cudaStreamWaitEvent(ctx.transferStream(), kernelDone, 0) != cudaSuccess)
+        {
+            cudaEventDestroy(kernelDone);
+            error = "cudaStreamWaitEvent(div kernel) failed";
+            return tmp<fvMatrix<Type>>();
+        }
+
+        const std::size_t coeffBytes = sizeof(scalar)*nFaces;
+        bool copyOk = true;
 
         if
         (
-            cudaMemcpy
+            cudaMemcpyAsync
             (
                 lower.begin(),
                 lowerDev.get(),
-                sizeof(scalar)*nFaces,
-                cudaMemcpyDeviceToHost
+                coeffBytes,
+                cudaMemcpyDeviceToHost,
+                ctx.transferStream()
             ) != cudaSuccess
         )
         {
-            error = "cudaMemcpy(lower device->host) failed";
+            error = "cudaMemcpyAsync(lower device->host) failed";
+            copyOk = false;
+        }
+
+        if (copyOk)
+        {
+            if
+            (
+                cudaMemcpyAsync
+                (
+                    upper.begin(),
+                    upperDev.get(),
+                    coeffBytes,
+                    cudaMemcpyDeviceToHost,
+                    ctx.transferStream()
+                ) != cudaSuccess
+            )
+            {
+                error = "cudaMemcpyAsync(upper device->host) failed";
+                copyOk = false;
+            }
+        }
+
+        if (!copyOk)
+        {
+            cudaEventDestroy(kernelDone);
             return tmp<fvMatrix<Type>>();
         }
 
         if
         (
-            cudaMemcpy
-            (
-                upper.begin(),
-                upperDev.get(),
-                sizeof(scalar)*nFaces,
-                cudaMemcpyDeviceToHost
-            ) != cudaSuccess
+            cudaStreamSynchronize(ctx.transferStream()) != cudaSuccess
         )
         {
-            error = "cudaMemcpy(upper device->host) failed";
+            cudaEventDestroy(kernelDone);
+            error = "cudaStreamSynchronize(div copies) failed";
             return tmp<fvMatrix<Type>>();
         }
+
+        cudaEventDestroy(kernelDone);
+
+        copiedCoeffs = true;
     }
     else if (stats)
     {

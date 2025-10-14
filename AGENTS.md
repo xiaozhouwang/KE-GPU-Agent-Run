@@ -60,6 +60,11 @@
    - Batch short kernels (ddt/div/laplacian/nut, etc.) via CUDA Graphs to cut launch overhead.
    - Introduce multi-stream execution to overlap device kernels with host-side assembly/reduction work.
    - Add optional SoA-friendly accessors or layouts if profiling flags strided-load penalties.
+   - **GPU pressure solver bring-up plan:**
+     - Capture residual/iteration traces for the current `cudaPCG` path (enable `reportGpuStats`/`logResidualTrajectory`) and profile with Nsight/`nvprof` to pinpoint stalls.
+     - Stabilise the GPU preconditioner: finish the cuSPARSE-based SGS/DIC path (or fix the coloured smoother) so convergence matches the CPU reference; guard all failures with a fast diagonal fallback.
+     - Re-enable the `cudaPCG` runtime selection once convergence matches the CPU shadow solve, keeping the watchdog/CPU fallback in place.
+     - Profile the fixed solver and apply the orchestration hooks (CUDA Graphs, multi-stream overlap) to drive end-to-end GPU wall time below the ~35 s CPU baseline.
 4. **Profiling, validation, and regression**
    - Expand timing CSV outputs to cover every GPU kernel and turbulence step; feed these into the benchmark scripts for automated reporting.
    - Maintain the parity harness (`run/scripts/run_gpu_parity.sh`) and push `run/scripts/benchmark_gpu_speed.sh` below the ~35 s CPU baseline before deployment.

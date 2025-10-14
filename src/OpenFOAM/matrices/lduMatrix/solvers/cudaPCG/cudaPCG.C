@@ -780,8 +780,7 @@ using DeviceScalar = double;
     if (reportStats)
     {
         Info<< "cudaPCG: diagonal range [" << minDiag << ", " << maxDiag << "]"
-            << " (regularised [" << minDiagReg << ", " << maxDiagReg << "])"
-            << nl;
+            << " (regularised [" << minDiagReg << ", " << maxDiagReg << "])" << nl;
     }
 
     DeviceScalar *d_vals=nullptr, *d_x=nullptr, *d_b=nullptr;
@@ -853,6 +852,7 @@ using DeviceScalar = double;
     const scalar stallRatioTol =
         controlDict_.lookupOrDefault<scalar>("stallRatioTol", scalar(0.99));
 
+    const Switch equilibrateMatrix = controlDict_.lookupOrDefault<Switch>("equilibrateMatrix", Switch(false));
     const scalar colourOmegaCfg = controlDict_.lookupOrDefault<scalar>("colourOmega", scalar(0.65));
     const scalar colourBackwardOmegaCfg = controlDict_.lookupOrDefault<scalar>("colourBackwardOmega", scalar(0.85));
     const scalar colourDiagFloorCfg = controlDict_.lookupOrDefault<scalar>("colourDiagFloor", scalar(1e-12));
@@ -1265,17 +1265,67 @@ using DeviceScalar = double;
     if (cudaMalloc(reinterpret_cast<void**>(&d_diagInv), sizeof(DeviceScalar)*rows) != cudaSuccess)
         return fail("cudaMalloc(diagInv)");
 
-    // Copy
+    // Optional symmetric diagonal equilibration A' = S*A*S, b' = S*b, x' = S^{-1} x
+    List<DeviceScalar> scaleHost;
+    List<DeviceScalar> invScaleHost;
+    if (equilibrateMatrix)
+    {
+        scaleHost.setSize(rows);
+        invScaleHost.setSize(rows);
+        for (int i = 0; i < rows; ++i)
+        {
+            const double reg = static_cast<double>(precondDiag[i]);
+            const double s = (reg > 0) ? 1.0/std::sqrt(reg) : 1.0;
+            scaleHost[i] = s;
+            invScaleHost[i] = (s != 0.0) ? (1.0/s) : 1.0;
+        }
+        // Scale CSR values on host: a'_{ij} = s_i * a_{ij} * s_j
+        for (int i = 0; i < rows; ++i)
+        {
+            const double si = static_cast<double>(scaleHost[i]);
+            for (int k = rowPtr[i]; k < rowPtr[i+1]; ++k)
+            {
+                const int j = colInd[k];
+                const double sj = static_cast<double>(scaleHost[j]);
+                values[k] = static_cast<DeviceScalar>(static_cast<double>(values[k]) * si * sj);
+            }
+        }
+        // Adjust diagInv for scaled diagonal (approximate: reg' = s_i^2 * reg)
+        for (int i = 0; i < rows; ++i)
+        {
+            const double si = static_cast<double>(scaleHost[i]);
+            const double reg = static_cast<double>(precondDiag[i]) * si * si;
+            diagInv[i] = (reg > VSMALL) ? static_cast<DeviceScalar>(1.0/reg) : static_cast<DeviceScalar>(0);
+        }
+    }
+
+    // Copy values
     if (cudaMemcpy(d_vals, values.begin(), sizeof(DeviceScalar)*nnz, cudaMemcpyHostToDevice) != cudaSuccess)
         return fail("cudaMemcpy(vals)");
     if (cudaMemcpy(d_rowPtr, rowPtr.begin(), sizeof(int)*(rows+1), cudaMemcpyHostToDevice) != cudaSuccess)
         return fail("cudaMemcpy(rowPtr)");
     if (cudaMemcpy(d_colInd, colInd.begin(), sizeof(int)*nnz, cudaMemcpyHostToDevice) != cudaSuccess)
         return fail("cudaMemcpy(colInd)");
-    if (cudaMemcpy(d_x, psi.begin(), sizeof(DeviceScalar)*rows, cudaMemcpyHostToDevice) != cudaSuccess)
-        return fail("cudaMemcpy(x)");
-    if (cudaMemcpy(d_b, source.begin(), sizeof(DeviceScalar)*rows, cudaMemcpyHostToDevice) != cudaSuccess)
-        return fail("cudaMemcpy(b)");
+    if (equilibrateMatrix)
+    {
+        List<DeviceScalar> xScaled(rows), bScaled(rows);
+        for (int i = 0; i < rows; ++i)
+        {
+            xScaled[i] = static_cast<DeviceScalar>(static_cast<double>(psi[i]) * static_cast<double>(invScaleHost[i]));
+            bScaled[i] = static_cast<DeviceScalar>(static_cast<double>(source[i]) * static_cast<double>(scaleHost[i]));
+        }
+        if (cudaMemcpy(d_x, xScaled.begin(), sizeof(DeviceScalar)*rows, cudaMemcpyHostToDevice) != cudaSuccess)
+            return fail("cudaMemcpy(xScaled)");
+        if (cudaMemcpy(d_b, bScaled.begin(), sizeof(DeviceScalar)*rows, cudaMemcpyHostToDevice) != cudaSuccess)
+            return fail("cudaMemcpy(bScaled)");
+    }
+    else
+    {
+        if (cudaMemcpy(d_x, psi.begin(), sizeof(DeviceScalar)*rows, cudaMemcpyHostToDevice) != cudaSuccess)
+            return fail("cudaMemcpy(x)");
+        if (cudaMemcpy(d_b, source.begin(), sizeof(DeviceScalar)*rows, cudaMemcpyHostToDevice) != cudaSuccess)
+            return fail("cudaMemcpy(b)");
+    }
     if (cudaMemcpy(d_diagInv, diagInv.begin(), sizeof(DeviceScalar)*rows, cudaMemcpyHostToDevice) != cudaSuccess)
         return fail("cudaMemcpy(diagInv)");
 
@@ -1391,7 +1441,16 @@ using DeviceScalar = double;
                     DeviceScalar v = values[k];
                     if (j == i)
                     {
-                        v = precondDiag[i];
+                        // Use regularised diagonal; if equilibrated, account for scaling (s_i^2)
+                        if (equilibrateMatrix)
+                        {
+                            const double si = (scaleHost.size() ? static_cast<double>(scaleHost[i]) : 1.0);
+                            v = static_cast<DeviceScalar>(static_cast<double>(precondDiag[i]) * si * si);
+                        }
+                        else
+                        {
+                            v = precondDiag[i];
+                        }
                     }
                     preValsHost[cursor] = v;
                     ++cursor;
@@ -2743,6 +2802,13 @@ using DeviceScalar = double;
     )
     {
         cudaMemcpy(psi.begin(), d_x, sizeof(DeviceScalar)*rows, cudaMemcpyDeviceToHost);
+        if (equilibrateMatrix && scaleHost.size())
+        {
+            for (int i = 0; i < rows; ++i)
+            {
+                psi[i] = static_cast<scalar>(static_cast<double>(psi[i]) * static_cast<double>(scaleHost[i]));
+            }
+        }
         cleanup();
         writeTelemetry(true, word::null);
         return true;
@@ -3004,6 +3070,13 @@ using DeviceScalar = double;
     }
 
     cudaMemcpy(psi.begin(), d_x, sizeof(DeviceScalar)*rows, cudaMemcpyDeviceToHost);
+    if (equilibrateMatrix && scaleHost.size())
+    {
+        for (int i = 0; i < rows; ++i)
+        {
+            psi[i] = static_cast<scalar>(static_cast<double>(psi[i]) * static_cast<double>(scaleHost[i]));
+        }
+    }
     cleanup();
     if (logResidualTrajectory)
     {

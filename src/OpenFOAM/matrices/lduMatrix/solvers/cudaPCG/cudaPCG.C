@@ -510,7 +510,7 @@ Foam::solverPerformance Foam::cudaPCG::solve
 
         // Normalise to CPU-registered names
         if (lower == word("sgs") || lower == word("symgaussseidel")
-         || lower == word("ic") || lower == word("dic")
+         || lower == word("ic") || lower == word("ic0") || lower == word("dic")
          || lower == word("colour") || lower == word("colored") || lower == word("coloured"))
         {
             cpuDict.set("preconditioner", word("DIC"));
@@ -785,6 +785,16 @@ using DeviceScalar = double;
     int *d_rowPtr=nullptr, *d_colInd=nullptr;
     int *d_colors=nullptr, *d_colorIndices=nullptr;
     int *d_failFlag=nullptr;
+    // ILU/IC resources
+    DeviceScalar *d_iluVals = nullptr; // values for ILU/IC factors (separate from d_vals)
+    cusparseMatDescr_t iluDescr = nullptr;
+    csrilu02Info_t iluInfo = nullptr; // ILU0 info
+    csric02Info_t icInfo = nullptr;   // IC0 info
+    cusparseSpMatDescr_t matL = nullptr, matU = nullptr;      // ILU L and U
+    cusparseSpMatDescr_t matLchol = nullptr;                  // IC0 L
+    cusparseSpSVDescr_t spsvLowerIlu = nullptr, spsvUpperIlu = nullptr;
+    cusparseSpSVDescr_t spsvLowerChol = nullptr, spsvUpperTChol = nullptr;
+    void* iluBuf = nullptr; size_t iluBufSize = 0;
 
     // Preconditioner configuration
     const word preconditionerWord = controlDict_.lookupOrDefault<word>("preconditioner", word("diagonal"));
@@ -792,6 +802,8 @@ using DeviceScalar = double;
 
     bool useColour = false;
     bool useSGS = false;
+    bool useILU = false;
+    bool useIC = false;
 
     if
     (
@@ -806,15 +818,18 @@ using DeviceScalar = double;
     {
         useColour = true;
     }
-    else if
-    (
-        precondLower == "sgs"
-     || precondLower == "symgaussseidel"
-     || precondLower == "ic"
-     || precondLower == "dic"
-    )
+    else if (precondLower == "sgs" || precondLower == "symgaussseidel")
     {
         useSGS = true;
+    }
+    else if (precondLower == "ilu0" || precondLower == "ilu")
+    {
+        useILU = true;
+    }
+    else if (precondLower == "ic0" || precondLower == "ic" || precondLower == "dic")
+    {
+        // Map DIC to IC0 on GPU for closer parity with CPU
+        useIC = true;
     }
 
     colourInitiallyRequested = useColour;
@@ -1170,6 +1185,19 @@ using DeviceScalar = double;
         if (spsvUpperT) cusparseSpSV_destroyDescr(spsvUpperT);
         if (spsvBuf) cudaFree(spsvBuf);
         if (d_preTmp2) cudaFree(d_preTmp2);
+        // ILU/IC resources
+        if (matL) cusparseDestroySpMat(matL);
+        if (matU) cusparseDestroySpMat(matU);
+        if (matLchol) cusparseDestroySpMat(matLchol);
+        if (spsvLowerIlu) cusparseSpSV_destroyDescr(spsvLowerIlu);
+        if (spsvUpperIlu) cusparseSpSV_destroyDescr(spsvUpperIlu);
+        if (spsvLowerChol) cusparseSpSV_destroyDescr(spsvLowerChol);
+        if (spsvUpperTChol) cusparseSpSV_destroyDescr(spsvUpperTChol);
+        if (iluBuf) cudaFree(iluBuf);
+        if (iluInfo) cusparseDestroyCsrilu02Info(iluInfo);
+        if (icInfo) cusparseDestroyCsric02Info(icInfo);
+        if (iluDescr) cusparseDestroyMatDescr(iluDescr);
+        if (d_iluVals) cudaFree(d_iluVals);
         if (spmvGraphExec)
         {
             cudaGraphExecDestroy(spmvGraphExec);
@@ -1486,7 +1514,7 @@ using DeviceScalar = double;
         }
     }
 
-    if ((usePolyJacobi || useColour) && !d_preTmp)
+    if ((usePolyJacobi || useColour || useSGS || useILU || useIC) && !d_preTmp)
     {
         if (cudaMalloc(reinterpret_cast<void**>(&d_preTmp), sizeof(DeviceScalar)*rows) != cudaSuccess)
         {
@@ -1498,6 +1526,309 @@ using DeviceScalar = double;
         if (cudaMalloc(reinterpret_cast<void**>(&d_preTmp2), sizeof(DeviceScalar)*rows) != cudaSuccess)
         {
             return fail("cudaMalloc(preTmp2)");
+        }
+    }
+
+    // Build optional ILU0/IC0 preconditioner using cuSPARSE (legacy csrilu02/csric02)
+    bool iluReady = false;
+    bool icReady = false;
+    std::string iluDisableReason;
+    if ((useILU || useIC) && !preIn)
+    {
+        if (cusparseCreateDnVec(&preIn, rows, d_preTmp, CUDA_R_64F) != CUSPARSE_STATUS_SUCCESS)
+        {
+            // preIn required for SpSV buffer sizing/analysis
+            useILU = false; useIC = false;
+        }
+        else if (cusparseCreateDnVec(&preOut, rows, d_preTmp, CUDA_R_64F) != CUSPARSE_STATUS_SUCCESS)
+        {
+            useILU = false; useIC = false;
+        }
+    }
+    if (useILU || useIC)
+    {
+        // Allocate separate values array for in-place factorization
+        if (cudaMalloc(reinterpret_cast<void**>(&d_iluVals), sizeof(DeviceScalar)*nnz) != cudaSuccess)
+        {
+            iluDisableReason = std::string("allocVals");
+        }
+        else if (cudaMemcpy(d_iluVals, d_vals, sizeof(DeviceScalar)*nnz, cudaMemcpyDeviceToDevice) != cudaSuccess)
+        {
+            iluDisableReason = std::string("copyVals");
+        }
+        else if (cusparseCreateMatDescr(&iluDescr) != CUSPARSE_STATUS_SUCCESS)
+        {
+            iluDisableReason = std::string("createDescr");
+        }
+        else
+        {
+            cusparseSetMatType(iluDescr, CUSPARSE_MATRIX_TYPE_GENERAL);
+            cusparseSetMatIndexBase(iluDescr, CUSPARSE_INDEX_BASE_ZERO);
+
+            if (useILU)
+            {
+                if (cusparseCreateCsrilu02Info(&iluInfo) == CUSPARSE_STATUS_SUCCESS)
+                {
+                    int bs = 0;
+                    if
+                    (
+                        cusparseDcsrilu02_bufferSize
+                        (
+                            cusparseHandle, rows, nnz,
+                            iluDescr,
+                            reinterpret_cast<double*>(d_iluVals),
+                            d_rowPtr, d_colInd,
+                            iluInfo, &bs
+                        ) == CUSPARSE_STATUS_SUCCESS
+                     && (bs == 0 || cudaMalloc(&iluBuf, bs) == cudaSuccess)
+                     && cusparseDcsrilu02_analysis
+                        (
+                            cusparseHandle, rows, nnz,
+                            iluDescr,
+                            reinterpret_cast<double*>(d_iluVals),
+                            d_rowPtr, d_colInd,
+                            iluInfo, CUSPARSE_SOLVE_POLICY_NO_LEVEL,
+                            iluBuf
+                        ) == CUSPARSE_STATUS_SUCCESS
+                     && cusparseDcsrilu02
+                        (
+                            cusparseHandle, rows, nnz,
+                            iluDescr,
+                            reinterpret_cast<double*>(d_iluVals),
+                            d_rowPtr, d_colInd,
+                            iluInfo, CUSPARSE_SOLVE_POLICY_NO_LEVEL,
+                            iluBuf
+                        ) == CUSPARSE_STATUS_SUCCESS
+                    )
+                    {
+                        if
+                        (
+                            cusparseCreateCsr(&matL, rows, rows, nnz, d_rowPtr, d_colInd, d_iluVals,
+                                CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F) == CUSPARSE_STATUS_SUCCESS
+                         && cusparseCreateCsr(&matU, rows, rows, nnz, d_rowPtr, d_colInd, d_iluVals,
+                                CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F) == CUSPARSE_STATUS_SUCCESS
+                         && cusparseSpSV_createDescr(&spsvLowerIlu) == CUSPARSE_STATUS_SUCCESS
+                         && cusparseSpSV_createDescr(&spsvUpperIlu) == CUSPARSE_STATUS_SUCCESS
+                        )
+                        {
+                            cusparseFillMode_t fillL = CUSPARSE_FILL_MODE_LOWER;
+                            cusparseDiagType_t diagL = CUSPARSE_DIAG_TYPE_UNIT;
+                            cusparseSpMatSetAttribute(matL, CUSPARSE_SPMAT_FILL_MODE, &fillL, sizeof(fillL));
+                            cusparseSpMatSetAttribute(matL, CUSPARSE_SPMAT_DIAG_TYPE, &diagL, sizeof(diagL));
+                            cusparseFillMode_t fillU = CUSPARSE_FILL_MODE_UPPER;
+                            cusparseDiagType_t diagU = CUSPARSE_DIAG_TYPE_NON_UNIT;
+                            cusparseSpMatSetAttribute(matU, CUSPARSE_SPMAT_FILL_MODE, &fillU, sizeof(fillU));
+                            cusparseSpMatSetAttribute(matU, CUSPARSE_SPMAT_DIAG_TYPE, &diagU, sizeof(diagU));
+
+                            const double oneD = 1.0; size_t bL=0, bU=0;
+                            if
+                            (
+                                cusparseSpSV_bufferSize
+                                (
+                                    cusparseHandle,
+                                    CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                    &oneD,
+                                    matL,
+                                    preIn,
+                                    preOut,
+                                    CUDA_R_64F,
+                                    CUSPARSE_SPSV_ALG_DEFAULT,
+                                    spsvLowerIlu,
+                                    &bL
+                                ) == CUSPARSE_STATUS_SUCCESS
+                             && cusparseSpSV_bufferSize
+                                (
+                                    cusparseHandle,
+                                    CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                    &oneD,
+                                    matU,
+                                    preIn,
+                                    preOut,
+                                    CUDA_R_64F,
+                                    CUSPARSE_SPSV_ALG_DEFAULT,
+                                    spsvUpperIlu,
+                                    &bU
+                                ) == CUSPARSE_STATUS_SUCCESS
+                            )
+                            {
+                                iluBufSize = std::max(iluBufSize, std::max(bL, bU));
+                                if ((iluBufSize == 0) || (cudaMalloc(&iluBuf, iluBufSize) == cudaSuccess))
+                                {
+                                    if
+                                    (
+                                        cusparseSpSV_analysis
+                                        (
+                                            cusparseHandle,
+                                            CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                            &oneD,
+                                            matL,
+                                            preIn,
+                                            preOut,
+                                            CUDA_R_64F,
+                                            CUSPARSE_SPSV_ALG_DEFAULT,
+                                            spsvLowerIlu,
+                                            iluBuf
+                                        ) == CUSPARSE_STATUS_SUCCESS
+                                     && cusparseSpSV_analysis
+                                        (
+                                            cusparseHandle,
+                                            CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                            &oneD,
+                                            matU,
+                                            preIn,
+                                            preOut,
+                                            CUDA_R_64F,
+                                            CUSPARSE_SPSV_ALG_DEFAULT,
+                                            spsvUpperIlu,
+                                            iluBuf
+                                        ) == CUSPARSE_STATUS_SUCCESS
+                                    )
+                                    {
+                                        iluReady = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        iluDisableReason = std::string("csrilu02");
+                    }
+                }
+                else
+                {
+                    iluDisableReason = std::string("createInfo");
+                }
+            }
+            else if (useIC)
+            {
+                if (cusparseCreateCsric02Info(&icInfo) == CUSPARSE_STATUS_SUCCESS)
+                {
+                    int bs = 0;
+                    if
+                    (
+                        cusparseDcsric02_bufferSize
+                        (
+                            cusparseHandle, rows, nnz,
+                            iluDescr,
+                            reinterpret_cast<double*>(d_iluVals),
+                            d_rowPtr, d_colInd,
+                            icInfo, &bs
+                        ) == CUSPARSE_STATUS_SUCCESS
+                     && (bs == 0 || cudaMalloc(&iluBuf, bs) == cudaSuccess)
+                     && cusparseDcsric02_analysis
+                        (
+                            cusparseHandle, rows, nnz,
+                            iluDescr,
+                            reinterpret_cast<double*>(d_iluVals),
+                            d_rowPtr, d_colInd,
+                            icInfo, CUSPARSE_SOLVE_POLICY_NO_LEVEL,
+                            iluBuf
+                        ) == CUSPARSE_STATUS_SUCCESS
+                     && cusparseDcsric02
+                        (
+                            cusparseHandle, rows, nnz,
+                            iluDescr,
+                            reinterpret_cast<double*>(d_iluVals),
+                            d_rowPtr, d_colInd,
+                            icInfo, CUSPARSE_SOLVE_POLICY_NO_LEVEL,
+                            iluBuf
+                        ) == CUSPARSE_STATUS_SUCCESS
+                    )
+                    {
+                        if
+                        (
+                            cusparseCreateCsr(&matLchol, rows, rows, nnz, d_rowPtr, d_colInd, d_iluVals,
+                                CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F) == CUSPARSE_STATUS_SUCCESS
+                         && cusparseSpSV_createDescr(&spsvLowerChol) == CUSPARSE_STATUS_SUCCESS
+                         && cusparseSpSV_createDescr(&spsvUpperTChol) == CUSPARSE_STATUS_SUCCESS
+                        )
+                        {
+                            cusparseFillMode_t fillL = CUSPARSE_FILL_MODE_LOWER;
+                            cusparseDiagType_t diagType = CUSPARSE_DIAG_TYPE_NON_UNIT;
+                            cusparseSpMatSetAttribute(matLchol, CUSPARSE_SPMAT_FILL_MODE, &fillL, sizeof(fillL));
+                            cusparseSpMatSetAttribute(matLchol, CUSPARSE_SPMAT_DIAG_TYPE, &diagType, sizeof(diagType));
+
+                            const double oneD = 1.0; size_t bL=0, bUT=0;
+                            if
+                            (
+                                cusparseSpSV_bufferSize
+                                (
+                                    cusparseHandle,
+                                    CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                    &oneD,
+                                    matLchol,
+                                    preIn,
+                                    preOut,
+                                    CUDA_R_64F,
+                                    CUSPARSE_SPSV_ALG_DEFAULT,
+                                    spsvLowerChol,
+                                    &bL
+                                ) == CUSPARSE_STATUS_SUCCESS
+                             && cusparseSpSV_bufferSize
+                                (
+                                    cusparseHandle,
+                                    CUSPARSE_OPERATION_TRANSPOSE,
+                                    &oneD,
+                                    matLchol,
+                                    preIn,
+                                    preOut,
+                                    CUDA_R_64F,
+                                    CUSPARSE_SPSV_ALG_DEFAULT,
+                                    spsvUpperTChol,
+                                    &bUT
+                                ) == CUSPARSE_STATUS_SUCCESS
+                            )
+                            {
+                                iluBufSize = std::max(iluBufSize, std::max(bL, bUT));
+                                if ((iluBufSize == 0) || (cudaMalloc(&iluBuf, iluBufSize) == cudaSuccess))
+                                {
+                                    if
+                                    (
+                                        cusparseSpSV_analysis
+                                        (
+                                            cusparseHandle,
+                                            CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                            &oneD,
+                                            matLchol,
+                                            preIn,
+                                            preOut,
+                                            CUDA_R_64F,
+                                            CUSPARSE_SPSV_ALG_DEFAULT,
+                                            spsvLowerChol,
+                                            iluBuf
+                                        ) == CUSPARSE_STATUS_SUCCESS
+                                     && cusparseSpSV_analysis
+                                        (
+                                            cusparseHandle,
+                                            CUSPARSE_OPERATION_TRANSPOSE,
+                                            &oneD,
+                                            matLchol,
+                                            preIn,
+                                            preOut,
+                                            CUDA_R_64F,
+                                            CUSPARSE_SPSV_ALG_DEFAULT,
+                                            spsvUpperTChol,
+                                            iluBuf
+                                        ) == CUSPARSE_STATUS_SUCCESS
+                                    )
+                                    {
+                                        icReady = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        iluDisableReason = std::string("csric02");
+                    }
+                }
+                else
+                {
+                    iluDisableReason = std::string("createInfo");
+                }
+            }
         }
     }
 
@@ -1898,6 +2229,112 @@ using DeviceScalar = double;
             // No descriptor state to restore when using transient DnVecs
             return true;
         }
+        else if (icReady)
+        {
+            // Incomplete Cholesky: solve L y = rhs; solve L^T out = y
+            const double oneD = 1.0;
+            if (cublasDcopy(cublasHandle, rows, rhs, 1, out, 1) != CUBLAS_STATUS_SUCCESS)
+            {
+                message = word("ICCopyFail");
+                return false;
+            }
+            cusparseDnVecSetValues(preIn, out);
+            cusparseDnVecSetValues(preOut, d_preTmp);
+            if
+            (
+                cusparseSpSV_solve
+                (
+                    cusparseHandle,
+                    CUSPARSE_OPERATION_NON_TRANSPOSE,
+                    &oneD,
+                    matLchol,
+                    preIn,
+                    preOut,
+                    CUDA_R_64F,
+                    CUSPARSE_SPSV_ALG_DEFAULT,
+                    spsvLowerChol
+                ) != CUSPARSE_STATUS_SUCCESS
+            )
+            {
+                message = word("ICLowerFail");
+                return false;
+            }
+            cusparseDnVecSetValues(preIn, d_preTmp);
+            cusparseDnVecSetValues(preOut, out);
+            if
+            (
+                cusparseSpSV_solve
+                (
+                    cusparseHandle,
+                    CUSPARSE_OPERATION_TRANSPOSE,
+                    &oneD,
+                    matLchol,
+                    preIn,
+                    preOut,
+                    CUDA_R_64F,
+                    CUSPARSE_SPSV_ALG_DEFAULT,
+                    spsvUpperTChol
+                ) != CUSPARSE_STATUS_SUCCESS
+            )
+            {
+                message = word("ICUpperTFail");
+                return false;
+            }
+            return true;
+        }
+        else if (iluReady)
+        {
+            // ILU0: solve L y = rhs; solve U out = y
+            const double oneD = 1.0;
+            if (cublasDcopy(cublasHandle, rows, rhs, 1, out, 1) != CUBLAS_STATUS_SUCCESS)
+            {
+                message = word("ILUCopyFail");
+                return false;
+            }
+            cusparseDnVecSetValues(preIn, out);
+            cusparseDnVecSetValues(preOut, d_preTmp);
+            if
+            (
+                cusparseSpSV_solve
+                (
+                    cusparseHandle,
+                    CUSPARSE_OPERATION_NON_TRANSPOSE,
+                    &oneD,
+                    matL,
+                    preIn,
+                    preOut,
+                    CUDA_R_64F,
+                    CUSPARSE_SPSV_ALG_DEFAULT,
+                    spsvLowerIlu
+                ) != CUSPARSE_STATUS_SUCCESS
+            )
+            {
+                message = word("ILULowerFail");
+                return false;
+            }
+            cusparseDnVecSetValues(preIn, d_preTmp);
+            cusparseDnVecSetValues(preOut, out);
+            if
+            (
+                cusparseSpSV_solve
+                (
+                    cusparseHandle,
+                    CUSPARSE_OPERATION_NON_TRANSPOSE,
+                    &oneD,
+                    matU,
+                    preIn,
+                    preOut,
+                    CUDA_R_64F,
+                    CUSPARSE_SPSV_ALG_DEFAULT,
+                    spsvUpperIlu
+                ) != CUSPARSE_STATUS_SUCCESS
+            )
+            {
+                message = word("ILUUpperFail");
+                return false;
+            }
+            return true;
+        }
         else if (sgsReady)
         {
             // out = M^{-1} rhs via SGS: solve (D+L) y = rhs; solve (D+L)^T out = y
@@ -1999,6 +2436,23 @@ using DeviceScalar = double;
             Info<< "cudaPCG(" << fieldName_ << "): SGS preconditioner disabled ("
                 << (sgsDisableReason.size() ? sgsDisableReason : std::string("buildFailure"))
                 << ")" << nl;
+        }
+    }
+    if (reportStats && (useILU || useIC))
+    {
+        if (useILU)
+        {
+            Info<< "cudaPCG(" << fieldName_ << "): ILU0 preconditioner "
+                << (iluReady ? "active" : "disabled")
+                << (iluReady ? "" : (std::string(" (") + (iluDisableReason.size()?iluDisableReason:"buildFailure") + ")"))
+                << nl;
+        }
+        if (useIC)
+        {
+            Info<< "cudaPCG(" << fieldName_ << "): IC0 preconditioner "
+                << (icReady ? "active" : "disabled")
+                << (icReady ? "" : (std::string(" (") + (iluDisableReason.size()?iluDisableReason:"buildFailure") + ")"))
+                << nl;
         }
     }
 

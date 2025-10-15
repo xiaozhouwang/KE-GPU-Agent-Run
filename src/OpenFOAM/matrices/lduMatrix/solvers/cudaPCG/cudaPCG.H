@@ -47,7 +47,8 @@ private:
         const direction cmpt,
         solverPerformance& solverPerf,
         const label deviceId,
-        word& message
+        word& message,
+        const dictionary& dict
     ) const;
 #endif
 };

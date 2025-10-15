@@ -19,6 +19,8 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <deque>
+#include <unordered_map>
 
 #ifdef FOAM_USE_CUDA
 #include <cuda_runtime.h>
@@ -48,6 +50,339 @@ inline std::string toLower(const std::string& s)
 }
 
 #ifdef FOAM_USE_CUDA
+
+struct ColourOverrideEntry
+{
+    bool baseInitialised = false;
+    bool active = false;
+    int stage = 0;
+    int successStreak = 0;
+    Foam::scalar baseOmega = 0;
+    Foam::scalar baseBackward = 0;
+    Foam::scalar baseDiag = 0;
+    Foam::scalar omega = 0;
+    Foam::scalar backwardOmega = 0;
+    Foam::scalar diagFloor = 0;
+};
+
+struct ColourOverrideRegistry
+{
+    std::mutex mutex;
+    std::unordered_map<std::string, ColourOverrideEntry> entries;
+};
+
+ColourOverrideRegistry& colourOverrides()
+{
+    static ColourOverrideRegistry registry;
+    return registry;
+}
+
+inline bool autoTuneEnabled(const Foam::dictionary& dict)
+{
+    return dict.lookupOrDefault<Foam::Switch>("colourAutoTune", Foam::Switch(true));
+}
+
+constexpr int maxColourStage = 3;
+constexpr int colourDemoteThreshold = 5;
+
+static void computeStageParams
+(
+    const ColourOverrideEntry& entry,
+    const int stage,
+    Foam::scalar& omega,
+    Foam::scalar& backward,
+    Foam::scalar& diag
+)
+{
+    omega = entry.baseOmega;
+    backward = entry.baseBackward;
+    diag = entry.baseDiag;
+
+    if (stage >= 1)
+    {
+        omega = std::min(omega, Foam::scalar(0.80));
+        backward = std::min(backward, Foam::scalar(0.85));
+        diag = std::max(diag, Foam::scalar(1e-9));
+    }
+    if (stage >= 2)
+    {
+        omega = std::min(omega, Foam::scalar(0.75));
+        backward = std::min(backward, Foam::scalar(0.82));
+        diag = std::max(diag, Foam::scalar(5e-9));
+    }
+    if (stage >= 3)
+    {
+        omega = std::min(omega, Foam::scalar(0.70));
+        backward = std::min(backward, Foam::scalar(0.80));
+        diag = std::max(diag, Foam::scalar(1e-8));
+    }
+    backward = std::max(backward, omega);
+}
+
+static void applyStage(ColourOverrideEntry& entry, int stage)
+{
+    stage = std::max(0, std::min(stage, maxColourStage));
+    entry.stage = stage;
+    entry.active = stage > 0;
+    computeStageParams(entry, stage, entry.omega, entry.backwardOmega, entry.diagFloor);
+    if (stage == 0)
+    {
+        entry.omega = entry.baseOmega;
+        entry.backwardOmega = entry.baseBackward;
+        entry.diagFloor = entry.baseDiag;
+        entry.active = false;
+    }
+    entry.successStreak = 0;
+}
+
+static ColourOverrideEntry& accessOverride
+(
+    const Foam::word& field,
+    const Foam::scalar baseOmega,
+    const Foam::scalar baseBackward,
+    const Foam::scalar baseDiag
+)
+{
+    auto& registry = colourOverrides();
+    std::lock_guard<std::mutex> guard(registry.mutex);
+    ColourOverrideEntry& entry = registry.entries[std::string(field)];
+    if (!entry.baseInitialised)
+    {
+        entry.baseInitialised = true;
+        entry.stage = 0;
+        entry.successStreak = 0;
+    }
+    entry.baseOmega = baseOmega;
+    entry.baseBackward = baseBackward;
+    entry.baseDiag = baseDiag;
+    if (entry.stage == 0)
+    {
+        entry.omega = baseOmega;
+        entry.backwardOmega = baseBackward;
+        entry.diagFloor = baseDiag;
+    }
+    return entry;
+}
+
+static void colourAutoTuneSetup
+(
+    const Foam::word& field,
+    const Foam::scalar baseOmega,
+    const Foam::scalar baseBackward,
+    const Foam::scalar baseDiag,
+    Foam::scalar& omega,
+    Foam::scalar& backward,
+    Foam::scalar& diag,
+    int& stageOut
+)
+{
+    auto& registry = colourOverrides();
+    std::lock_guard<std::mutex> guard(registry.mutex);
+    ColourOverrideEntry& entry = registry.entries[std::string(field)];
+    if (!entry.baseInitialised)
+    {
+        entry.baseInitialised = true;
+        entry.stage = 0;
+        entry.successStreak = 0;
+    }
+    entry.baseOmega = baseOmega;
+    entry.baseBackward = baseBackward;
+    entry.baseDiag = baseDiag;
+    if (entry.stage == 0)
+    {
+        entry.omega = baseOmega;
+        entry.backwardOmega = baseBackward;
+        entry.diagFloor = baseDiag;
+        entry.active = false;
+    }
+    else
+    {
+        computeStageParams(entry, entry.stage, entry.omega, entry.backwardOmega, entry.diagFloor);
+    }
+
+    omega = entry.omega;
+    backward = entry.backwardOmega;
+    diag = entry.diagFloor;
+    stageOut = entry.stage;
+}
+
+static void colourAutoTunePromote
+(
+    const Foam::word& field,
+    const Foam::scalar baseOmega,
+    const Foam::scalar baseBackward,
+    const Foam::scalar baseDiag,
+    Foam::scalar& omega,
+    Foam::scalar& backward,
+    Foam::scalar& diag,
+    int& stageOut
+)
+{
+    auto& registry = colourOverrides();
+    std::lock_guard<std::mutex> guard(registry.mutex);
+    ColourOverrideEntry& entry = registry.entries[std::string(field)];
+    if (!entry.baseInitialised)
+    {
+        entry.baseInitialised = true;
+        entry.stage = 0;
+        entry.successStreak = 0;
+        entry.baseOmega = baseOmega;
+        entry.baseBackward = baseBackward;
+        entry.baseDiag = baseDiag;
+    }
+    else
+    {
+        entry.baseOmega = baseOmega;
+        entry.baseBackward = baseBackward;
+        entry.baseDiag = baseDiag;
+    }
+    const int newStage = std::min(entry.stage + 1, maxColourStage);
+    applyStage(entry, newStage);
+    omega = entry.omega;
+   backward = entry.backwardOmega;
+   diag = entry.diagFloor;
+   stageOut = entry.stage;
+}
+
+static void stageThresholds
+(
+    const int stage,
+    const Foam::label baseWindow,
+    const Foam::label baseBestWindow,
+    const Foam::scalar baseRatio,
+    const Foam::scalar baseBestRatio,
+    Foam::label& outWindow,
+    Foam::label& outBestWindow,
+    Foam::scalar& outRatio,
+    Foam::scalar& outBestRatio
+)
+{
+    outWindow = baseWindow;
+    outBestWindow = baseBestWindow;
+    outRatio = baseRatio;
+    outBestRatio = baseBestRatio;
+
+    if (stage >= 1)
+    {
+        outRatio = std::max(outRatio, Foam::scalar(0.9995));
+        outBestRatio = std::max(outBestRatio, Foam::scalar(1.02));
+        outWindow = std::max(outWindow, Foam::label(400));
+        outBestWindow = std::max(outBestWindow, Foam::label(400));
+    }
+    if (stage >= 2)
+    {
+        outRatio = std::max(outRatio, Foam::scalar(0.9997));
+        outBestRatio = std::max(outBestRatio, Foam::scalar(1.03));
+        outWindow = std::max(outWindow, Foam::label(600));
+        outBestWindow = std::max(outBestWindow, Foam::label(600));
+    }
+    if (stage >= 3)
+    {
+        outRatio = std::max(outRatio, Foam::scalar(0.9998));
+        outBestRatio = std::max(outBestRatio, Foam::scalar(1.04));
+        outWindow = std::max(outWindow, Foam::label(800));
+        outBestWindow = std::max(outBestWindow, Foam::label(800));
+    }
+}
+
+static void colourAutoTuneRecordSuccess(const Foam::word& field)
+{
+    auto& registry = colourOverrides();
+    std::lock_guard<std::mutex> guard(registry.mutex);
+    auto iter = registry.entries.find(std::string(field));
+    if (iter == registry.entries.end())
+    {
+        return;
+    }
+    ColourOverrideEntry& entry = iter->second;
+    if (entry.stage == 0)
+    {
+        entry.successStreak = std::min(entry.successStreak + 1, colourDemoteThreshold);
+        return;
+    }
+    entry.successStreak++;
+    if (entry.successStreak >= colourDemoteThreshold)
+    {
+        const int newStage = std::max(entry.stage - 1, 0);
+        applyStage(entry, newStage);
+    }
+}
+
+static void colourAutoTuneRecordFailure(const Foam::word& field)
+{
+    auto& registry = colourOverrides();
+    std::lock_guard<std::mutex> guard(registry.mutex);
+    auto iter = registry.entries.find(std::string(field));
+    if (iter == registry.entries.end())
+    {
+        return;
+    }
+    iter->second.successStreak = 0;
+}
+
+static void colourAutoTuneReset(const Foam::word& field)
+{
+    auto& registry = colourOverrides();
+    std::lock_guard<std::mutex> guard(registry.mutex);
+    auto iter = registry.entries.find(std::string(field));
+    if (iter == registry.entries.end())
+    {
+        return;
+    }
+    applyStage(iter->second, 0);
+}
+
+static int colourAutoTuneStage(const Foam::word& field)
+{
+    auto& registry = colourOverrides();
+    std::lock_guard<std::mutex> guard(registry.mutex);
+    auto iter = registry.entries.find(std::string(field));
+    if (iter == registry.entries.end())
+    {
+        return 0;
+    }
+    return iter->second.stage;
+}
+
+static void normaliseCpuPreconditioner(Foam::dictionary& dict)
+{
+    const Foam::word precon = dict.lookupOrDefault<Foam::word>("preconditioner", Foam::word("DIC"));
+    const Foam::word lower = toLower(precon);
+
+    if (lower == Foam::word("sgs") || lower == Foam::word("symgaussseidel")
+     || lower == Foam::word("ic") || lower == Foam::word("ic0") || lower == Foam::word("dic")
+     || lower == Foam::word("colour") || lower == Foam::word("colored") || lower == Foam::word("coloured"))
+    {
+        dict.set("preconditioner", Foam::word("DIC"));
+    }
+    else if (lower == Foam::word("fdic"))
+    {
+        dict.set("preconditioner", Foam::word("FDIC"));
+    }
+    else if (lower == Foam::word("ilu0") || lower == Foam::word("ilu"))
+    {
+        dict.set("preconditioner", Foam::word("DIC"));
+    }
+    else if (lower == Foam::word("gamg"))
+    {
+        dict.set("preconditioner", Foam::word("GAMG"));
+    }
+    else if (lower == Foam::word("diagonal") || lower == Foam::word("none"))
+    {
+        dict.set("preconditioner", lower);
+    }
+
+    dict.remove("colourOmega");
+    dict.remove("colourBackwardOmega");
+    dict.remove("colourDiagFloor");
+    dict.remove("stallRatioTol");
+    dict.remove("stallBestRatioTol");
+    dict.remove("stallWindow");
+    dict.remove("stallBestWindow");
+    dict.remove("polyJacobiAuto");
+    dict.remove("polyJacobiSweeps");
+    dict.remove("jacobiOmega");
+}
 
 inline const char* cuStatusName(CUresult code)
 {
@@ -468,6 +803,12 @@ Foam::solverPerformance Foam::cudaPCG::solve
 
     const label requestedDevice = controlDict_.lookupOrDefault<label>("gpuDevice", 0);
     const label deviceId = controlDict_.lookupOrDefault<label>("deviceId", requestedDevice);
+    const Switch hybridCpuCorrection =
+        controlDict_.lookupOrDefault<Switch>("hybridCpuCorrection", Switch(false));
+    const label hybridStageThreshold =
+        std::max<label>(0, controlDict_.lookupOrDefault<label>("hybridStageThreshold", 1));
+    const scalar hybridBlend =
+        std::min<scalar>(1.0, std::max<scalar>(0.0, controlDict_.lookupOrDefault<scalar>("hybridBlend", scalar(1))));
 
 #ifdef FOAM_USE_CUDA
     if (requestedGpu)
@@ -479,14 +820,223 @@ Foam::solverPerformance Foam::cudaPCG::solve
         );
 
         word message;
-        if (gpuSolve(psi, source, cmpt, gpuPerf, deviceId, message))
+        if (gpuSolve(psi, source, cmpt, gpuPerf, deviceId, message, controlDict_))
         {
+            if (hybridCpuCorrection)
+            {
+                const int stage = colourAutoTuneStage(fieldName_);
+                if (stage >= hybridStageThreshold)
+                {
+                    dictionary hybridCpuDict(controlDict_);
+                    hybridCpuDict.set("solver", word("PCG"));
+                    normaliseCpuPreconditioner(hybridCpuDict);
+                    autoPtr<lduMatrix::solver> hybridSolver = lduMatrix::solver::New
+                    (
+                        fieldName_,
+                        matrix_,
+                        interfaceBouCoeffs_,
+                        interfaceIntCoeffs_,
+                        interfaces_,
+                        hybridCpuDict
+                    );
+                    scalarField gpuPsi(psi);
+                    solverPerformance cpuPerf = hybridSolver->solve(psi, source, cmpt);
+                    if (hybridBlend > 0 && hybridBlend < 1)
+                    {
+                        const scalar alpha = hybridBlend;
+                        const scalar beta = 1 - alpha;
+                        forAll(psi, i)
+                        {
+                            psi[i] = alpha*psi[i] + beta*gpuPsi[i];
+                        }
+                    }
+                    gpuPerf.initialResidual() = cpuPerf.initialResidual();
+                    gpuPerf.finalResidual() = cpuPerf.finalResidual();
+                    gpuPerf.nIterations() += cpuPerf.nIterations();
+                    InfoInFunction
+                        << "cudaPCG hybrid CPU correction stage=" << stage
+                        << " iterations=" << cpuPerf.nIterations() << nl;
+                }
+            }
             return gpuPerf;
+        }
+
+        if (message == word("stallDetected"))
+        {
+            const word preconWord = controlDict_.lookupOrDefault<word>("preconditioner", word("colour"));
+            const std::string preconLower = toLower(preconWord);
+            const bool colourPrecon =
+                preconLower.find("colour") != std::string::npos
+             || preconLower.find("color") != std::string::npos
+             || preconLower.find("composite") != std::string::npos;
+
+            if (colourPrecon)
+            {
+                const scalar baseColourOmega = controlDict_.lookupOrDefault<scalar>("colourOmega", scalar(0.65));
+                const scalar baseColourBackward = controlDict_.lookupOrDefault<scalar>("colourBackwardOmega", scalar(0.85));
+                const scalar baseColourDiag = controlDict_.lookupOrDefault<scalar>("colourDiagFloor", scalar(1e-12));
+                const label baseStallWindow = controlDict_.lookupOrDefault<label>("stallWindow", 50);
+                const label baseStallBestWindow = controlDict_.lookupOrDefault<label>("stallBestWindow", baseStallWindow);
+                const scalar baseStallRatioTol = controlDict_.lookupOrDefault<scalar>("stallRatioTol", scalar(0.99));
+                const scalar baseStallBestRatioTol = controlDict_.lookupOrDefault<scalar>("stallBestRatioTol", scalar(1.001));
+                dictionary retryDict(controlDict_);
+                scalar tunedOmega = baseColourOmega;
+                scalar tunedBackward = baseColourBackward;
+                scalar tunedDiag = baseColourDiag;
+
+                if (autoTuneEnabled(controlDict_))
+                {
+                    int retryStage = 0;
+                    colourAutoTunePromote
+                    (
+                        fieldName_,
+                        baseColourOmega,
+                        baseColourBackward,
+                        baseColourDiag,
+                        tunedOmega,
+                        tunedBackward,
+                        tunedDiag,
+                        retryStage
+                    );
+                    Foam::label tunedStallWindow = baseStallWindow;
+                    Foam::label tunedStallBestWindow = baseStallBestWindow;
+                    Foam::scalar tunedStallRatio = baseStallRatioTol;
+                    Foam::scalar tunedStallBestRatio = baseStallBestRatioTol;
+                    stageThresholds
+                    (
+                        retryStage,
+                        baseStallWindow,
+                        baseStallBestWindow,
+                        baseStallRatioTol,
+                        baseStallBestRatioTol,
+                        tunedStallWindow,
+                        tunedStallBestWindow,
+                        tunedStallRatio,
+                        tunedStallBestRatio
+                    );
+                    retryDict.set("stallWindow", tunedStallWindow);
+                    retryDict.set("stallBestWindow", tunedStallBestWindow);
+                    retryDict.set("stallRatioTol", tunedStallRatio);
+                    retryDict.set("stallBestRatioTol", tunedStallBestRatio);
+                }
+                else
+                {
+                    tunedOmega = scalar(std::max<scalar>(0.5, std::min<scalar>(baseColourOmega, scalar(0.8))));
+                    tunedBackward = scalar(std::max<scalar>(0.5, std::min<scalar>(baseColourBackward, scalar(0.85))));
+                    tunedDiag = scalar(std::max<scalar>(baseColourDiag, scalar(1e-9)));
+                    Foam::label tunedStallWindow = baseStallWindow;
+                    Foam::label tunedStallBestWindow = baseStallBestWindow;
+                    Foam::scalar tunedStallRatio = baseStallRatioTol;
+                    Foam::scalar tunedStallBestRatio = baseStallBestRatioTol;
+                    stageThresholds
+                    (
+                        1,
+                        baseStallWindow,
+                        baseStallBestWindow,
+                        baseStallRatioTol,
+                        baseStallBestRatioTol,
+                        tunedStallWindow,
+                        tunedStallBestWindow,
+                        tunedStallRatio,
+                        tunedStallBestRatio
+                    );
+                    retryDict.set("stallRatioTol", tunedStallRatio);
+                    retryDict.set("stallBestRatioTol", tunedStallBestRatio);
+                    retryDict.set("stallWindow", tunedStallWindow);
+                    retryDict.set("stallBestWindow", tunedStallBestWindow);
+                }
+
+                retryDict.set("colourOmega", tunedOmega);
+                retryDict.set("colourBackwardOmega", tunedBackward);
+                retryDict.set("colourDiagFloor", tunedDiag);
+
+                solverPerformance retryPerf
+                (
+                    lduMatrix::preconditioner::getName(retryDict) + typeName + "::retry",
+                    fieldName_
+                );
+
+                word retryMessage;
+                if (gpuSolve(psi, source, cmpt, retryPerf, deviceId, retryMessage, retryDict))
+                {
+                    if (autoTuneEnabled(controlDict_) && colourPrecon)
+                    {
+                        colourAutoTuneRecordSuccess(fieldName_);
+                    }
+                    if (hybridCpuCorrection)
+                    {
+                        const int stage = colourAutoTuneStage(fieldName_);
+                        if (stage >= hybridStageThreshold)
+                        {
+                        dictionary hybridCpuDict(controlDict_);
+                        hybridCpuDict.set("solver", word("PCG"));
+                        normaliseCpuPreconditioner(hybridCpuDict);
+                        autoPtr<lduMatrix::solver> hybridSolver = lduMatrix::solver::New
+                        (
+                            fieldName_,
+                            matrix_,
+                            interfaceBouCoeffs_,
+                            interfaceIntCoeffs_,
+                            interfaces_,
+                            hybridCpuDict
+                            );
+                            scalarField gpuPsi(psi);
+                            solverPerformance cpuPerf = hybridSolver->solve(psi, source, cmpt);
+                            if (hybridBlend > 0 && hybridBlend < 1)
+                            {
+                                const scalar alpha = hybridBlend;
+                                const scalar beta = 1 - alpha;
+                                forAll(psi, i)
+                                {
+                                    psi[i] = alpha*psi[i] + beta*gpuPsi[i];
+                                }
+                            }
+                            retryPerf.initialResidual() = cpuPerf.initialResidual();
+                            retryPerf.finalResidual() = cpuPerf.finalResidual();
+                            retryPerf.nIterations() += cpuPerf.nIterations();
+                            InfoInFunction
+                                << "cudaPCG hybrid CPU correction stage=" << stage
+                                << " iterations=" << cpuPerf.nIterations() << nl;
+                        }
+                    }
+                    InfoInFunction
+                        << "cudaPCG retry succeeded after stall; colourOmega="
+                        << retryDict.lookupOrDefault<scalar>("colourOmega", scalar(0))
+                        << " colourDiagFloor="
+                        << retryDict.lookupOrDefault<scalar>("colourDiagFloor", scalar(0))
+                        << nl;
+                    return retryPerf;
+                }
+                else
+                {
+                    message = retryMessage;
+                    if (autoTuneEnabled(controlDict_) && colourPrecon)
+                    {
+                        colourAutoTuneRecordFailure(fieldName_);
+                    }
+                    WarningInFunction
+                        << "cudaPCG retry attempt failed: " << message << nl;
+                }
+            }
         }
 
         WarningInFunction
             << "cudaPCG GPU path disabled: " << message << nl
             << "Falling back to CPU PCG." << endl;
+        if (autoTuneEnabled(controlDict_))
+        {
+            const word preconWord = controlDict_.lookupOrDefault<word>("preconditioner", word("colour"));
+            const std::string preconLowerFinal = toLower(preconWord);
+            if
+            (
+                preconLowerFinal.find("colour") != std::string::npos
+             || preconLowerFinal.find("color") != std::string::npos
+             || preconLowerFinal.find("composite") != std::string::npos
+            )
+            {
+                colourAutoTuneRecordFailure(fieldName_);
+            }
+        }
     }
 #else
     if (requestedGpu)
@@ -499,49 +1049,7 @@ Foam::solverPerformance Foam::cudaPCG::solve
 
     dictionary cpuDict(controlDict_);
     cpuDict.set("solver", word("PCG"));
-
-    // Ensure CPU compatibility: translate GPU-only preconditioners
-    // If the case configured an unknown preconditioner (e.g. "sgs" or "colour"),
-    // fall back to a stock CPU preconditioner to avoid runtime aborts
-    // when constructing the CPU PCG.
-    {
-        const word precon = cpuDict.lookupOrDefault<word>("preconditioner", word("DIC"));
-        const word lower = toLower(precon);
-
-        // Normalise to CPU-registered names
-        if (lower == word("sgs") || lower == word("symgaussseidel")
-         || lower == word("ic") || lower == word("ic0") || lower == word("dic")
-         || lower == word("colour") || lower == word("colored") || lower == word("coloured"))
-        {
-            cpuDict.set("preconditioner", word("DIC"));
-        }
-        else if (lower == word("fdic"))
-        {
-            cpuDict.set("preconditioner", word("FDIC"));
-        }
-        else if (lower == word("ilu0") || lower == word("ilu"))
-        {
-            // No ILU preconditioner in CPU registry; map to DIC
-            cpuDict.set("preconditioner", word("DIC"));
-        }
-        else if (lower == word("gamg"))
-        {
-            cpuDict.set("preconditioner", word("GAMG"));
-        }
-        else if (lower == word("diagonal") || lower == word("none"))
-        {
-            // keep as-is (already lowercase) – both are registered names
-            cpuDict.set("preconditioner", lower);
-        }
-
-        // Remove GPU-only tuning entries that some CPU preconditioners do not recognise
-        // (silently ignore if absent).
-        cpuDict.remove("colourOmega");
-        cpuDict.remove("colourBackwardOmega");
-        cpuDict.remove("polyJacobiAuto");
-        cpuDict.remove("polyJacobiSweeps");
-        cpuDict.remove("jacobiOmega");
-    }
+    normaliseCpuPreconditioner(cpuDict);
 
     autoPtr<lduMatrix::solver> cpuSolver = lduMatrix::solver::New
     (
@@ -594,14 +1102,15 @@ inline const char* cublasStatusName(cublasStatus_t code)
 } // namespace
 
 bool Foam::cudaPCG::gpuSolve
-(
-    scalarField& psi,
-    const scalarField& source,
-    const direction cmpt,
-    solverPerformance& solverPerf,
-    const label deviceId,
-    word& message
-) const
+    (
+        scalarField& psi,
+        const scalarField& source,
+        const direction cmpt,
+        solverPerformance& solverPerf,
+        const label deviceId,
+        word& message,
+        const dictionary& dict
+    ) const
 {
     message.clear();
 
@@ -614,38 +1123,38 @@ bool Foam::cudaPCG::gpuSolve
     }
 
     const bool reportStats =
-        controlDict_.lookupOrDefault<Switch>("reportGpuStats", Switch(false));
+        dict.lookupOrDefault<Switch>("reportGpuStats", Switch(false));
 
     const Switch logResidualTrajectorySwitch =
-        controlDict_.lookupOrDefault<Switch>("logResidualTrajectory", Switch(false));
+        dict.lookupOrDefault<Switch>("logResidualTrajectory", Switch(false));
     const bool logResidualTrajectory = bool(logResidualTrajectorySwitch);
 
     const Switch pipelinedSwitch =
-        controlDict_.lookupOrDefault<Switch>("usePipelinedCG", Switch(false));
+        dict.lookupOrDefault<Switch>("usePipelinedCG", Switch(false));
     const bool usePipelinedCG = bool(pipelinedSwitch);
 
     const Switch cudaGraphSwitch =
-        controlDict_.lookupOrDefault<Switch>("useCudaGraph", Switch(false));
+        dict.lookupOrDefault<Switch>("useCudaGraph", Switch(false));
     const bool useCudaGraph = bool(cudaGraphSwitch);
     const label cudaGraphWarmup =
-        std::max<label>(0, controlDict_.lookupOrDefault<label>("cudaGraphWarmup", 5));
+        std::max<label>(0, dict.lookupOrDefault<label>("cudaGraphWarmup", 5));
 
     const Switch iterStatsSwitch =
-        controlDict_.lookupOrDefault<Switch>("logIterationStats", Switch(false));
+        dict.lookupOrDefault<Switch>("logIterationStats", Switch(false));
     const bool logIterationStats = bool(iterStatsSwitch);
 
     const label residualLogEvery =
-        std::max<label>(1, controlDict_.lookupOrDefault<label>("residualLogEvery", 1));
+        std::max<label>(1, dict.lookupOrDefault<label>("residualLogEvery", 1));
 
     fileName residualLogFile =
-        controlDict_.lookupOrDefault<fileName>("residualLogFile", fileName::null);
+        dict.lookupOrDefault<fileName>("residualLogFile", fileName::null);
 
     const Switch logColourStatsSwitch =
-        controlDict_.lookupOrDefault<Switch>("logColourStats", Switch(reportStats));
+        dict.lookupOrDefault<Switch>("logColourStats", Switch(reportStats));
     const bool logColourStats = bool(logColourStatsSwitch);
 
     fileName colourStatsFile =
-        controlDict_.lookupOrDefault<fileName>("colourStatsFile", fileName::null);
+        dict.lookupOrDefault<fileName>("colourStatsFile", fileName::null);
 
     if (logResidualTrajectory && residualLogFile == fileName::null)
     {
@@ -685,10 +1194,13 @@ bool Foam::cudaPCG::gpuSolve
     bool spmvGraphReady = false;
 
     double setupTimeSeconds = 0.0;
-    double iterationAccumSeconds = 0.0;
-    double iterationMaxSeconds = 0.0;
-    label iterationCountStats = 0;
-    label stallCounter = 0;
+   double iterationAccumSeconds = 0.0;
+   double iterationMaxSeconds = 0.0;
+   label iterationCountStats = 0;
+    label stallInitCounter = 0;
+    label stallWindowCounter = 0;
+    std::deque<scalar> residualWindow;
+    scalar bestResidualSoFar = std::numeric_limits<scalar>::max();
 
     cudaError_t cudaCode = cudaSetDevice(deviceId);
     if (cudaCode != cudaSuccess)
@@ -724,9 +1236,9 @@ using DeviceScalar = double;
 
     const scalarField& diag = matrix_.diag();
     const scalar diagFloorAbsCfg =
-        controlDict_.lookupOrDefault<scalar>("preconditionerDiagFloor", scalar(1e-20));
+        dict.lookupOrDefault<scalar>("preconditionerDiagFloor", scalar(1e-20));
     const scalar diagFloorRelCfg =
-        controlDict_.lookupOrDefault<scalar>("preconditionerDiagRelFloor", scalar(0));
+        dict.lookupOrDefault<scalar>("preconditionerDiagRelFloor", scalar(0));
 
     scalar minDiag = std::numeric_limits<scalar>::max();
     scalar maxDiag = -std::numeric_limits<scalar>::max();
@@ -801,7 +1313,7 @@ using DeviceScalar = double;
     void* iluBuf = nullptr; size_t iluBufSize = 0;
 
     // Preconditioner configuration
-    const word preconditionerWord = controlDict_.lookupOrDefault<word>("preconditioner", word("diagonal"));
+    const word preconditionerWord = dict.lookupOrDefault<word>("preconditioner", word("diagonal"));
     const std::string precondLower = toLower(preconditionerWord);
 
     bool useColour = false;
@@ -845,32 +1357,85 @@ using DeviceScalar = double;
 
     colourInitiallyRequested = useColour;
 
-    label polySweepsCfg = controlDict_.lookupOrDefault<label>("polyJacobiSweeps", 0);
-    scalar jacOmegaCfg = controlDict_.lookupOrDefault<scalar>("jacobiOmega", scalar(0.7));
-    const Switch polyAuto = controlDict_.lookupOrDefault<Switch>("polyJacobiAuto", Switch(true));
+    label polySweepsCfg = dict.lookupOrDefault<label>("polyJacobiSweeps", 0);
+    scalar jacOmegaCfg = dict.lookupOrDefault<scalar>("jacobiOmega", scalar(0.7));
+    const Switch polyAuto = dict.lookupOrDefault<Switch>("polyJacobiAuto", Switch(true));
     bool usePolyJacobi = (!useColour && !useSGS && !useILU && !useIC) && ((polySweepsCfg > 0) || polyAuto);
     label polySweepsEff = polySweepsCfg;
     double jacOmegaEff = static_cast<double>(jacOmegaCfg);
 
     const Switch earlyAbortOnStall =
-        controlDict_.lookupOrDefault<Switch>("earlyAbortOnStall", Switch(false));
-    const label stallWindow =
-        std::max<label>(1, controlDict_.lookupOrDefault<label>("stallWindow", 50));
-    const scalar stallRatioTol =
-        controlDict_.lookupOrDefault<scalar>("stallRatioTol", scalar(0.99));
+        dict.lookupOrDefault<Switch>("earlyAbortOnStall", Switch(false));
+    label stallWindow =
+        std::max<label>(1, dict.lookupOrDefault<label>("stallWindow", 50));
+    scalar stallRatioTol =
+        dict.lookupOrDefault<scalar>("stallRatioTol", scalar(0.99));
+    label stallBestWindow =
+        std::max<label>
+        (
+            1,
+            dict.lookupOrDefault<label>("stallBestWindow", stallWindow)
+        );
+    scalar stallBestRatioTol =
+        dict.lookupOrDefault<scalar>("stallBestRatioTol", scalar(1.001));
+    const label baseStallWindow = stallWindow;
+    const label baseStallBestWindow = stallBestWindow;
+    const scalar baseStallRatioTol = stallRatioTol;
+    const scalar baseStallBestRatioTol = stallBestRatioTol;
 
-    const Switch equilibrateMatrix = controlDict_.lookupOrDefault<Switch>("equilibrateMatrix", Switch(false));
-    const scalar colourOmegaCfg = controlDict_.lookupOrDefault<scalar>("colourOmega", scalar(0.65));
-    const scalar colourBackwardOmegaCfg = controlDict_.lookupOrDefault<scalar>("colourBackwardOmega", scalar(0.85));
-    const scalar colourDiagFloorCfg = controlDict_.lookupOrDefault<scalar>("colourDiagFloor", scalar(1e-12));
+    const Switch equilibrateMatrix = dict.lookupOrDefault<Switch>("equilibrateMatrix", Switch(false));
+    scalar colourOmegaCfg = dict.lookupOrDefault<scalar>("colourOmega", scalar(0.65));
+    scalar colourBackwardOmegaCfg = dict.lookupOrDefault<scalar>("colourBackwardOmega", scalar(0.85));
+    scalar colourDiagFloorCfg = dict.lookupOrDefault<scalar>("colourDiagFloor", scalar(1e-12));
+    const scalar baseColourOmega = colourOmegaCfg;
+    const scalar baseColourBackward = colourBackwardOmegaCfg;
+    const scalar baseColourDiag = colourDiagFloorCfg;
+    if (useColour)
+    {
+        int colourStage = 0;
+        if (autoTuneEnabled(dict))
+        {
+            colourAutoTuneSetup
+            (
+                fieldName_,
+                baseColourOmega,
+                baseColourBackward,
+                baseColourDiag,
+                colourOmegaCfg,
+                colourBackwardOmegaCfg,
+                colourDiagFloorCfg,
+                colourStage
+            );
+            stageThresholds
+            (
+                colourStage,
+                baseStallWindow,
+                baseStallBestWindow,
+                baseStallRatioTol,
+                baseStallBestRatioTol,
+                stallWindow,
+                stallBestWindow,
+                stallRatioTol,
+                stallBestRatioTol
+            );
+        }
+        else
+        {
+            colourAutoTuneReset(fieldName_);
+        }
+    }
+    else if (autoTuneEnabled(dict))
+    {
+        colourAutoTuneReset(fieldName_);
+    }
     const label colourBlockSizeCfg =
         std::max<label>
         (
             32,
-            std::min<label>(1024, controlDict_.lookupOrDefault<label>("colourBlockSize", 128))
+            std::min<label>(1024, dict.lookupOrDefault<label>("colourBlockSize", 128))
         );
     const bool colourVerbose =
-        controlDict_.lookupOrDefault<Switch>("colourVerbose", Switch(false));
+        dict.lookupOrDefault<Switch>("colourVerbose", Switch(false));
 
     const double colourOmegaEff = std::max(0.0, std::min(1.0, static_cast<double>(colourOmegaCfg)));
     const double colourBackwardOmegaEff = std::max(0.0, std::min(1.0, static_cast<double>(colourBackwardOmegaCfg)));
@@ -1623,8 +2188,8 @@ using DeviceScalar = double;
         List<DeviceScalar> iluValsHost(nnz);
         for (int i = 0; i < nnz; ++i) iluValsHost[i] = values[i];
 
-        const scalar iluDiagAbsFloorCfg = controlDict_.lookupOrDefault<scalar>("iluDiagAbsFloor", diagFloorCfg);
-        const scalar iluDiagRelFloorCfg = controlDict_.lookupOrDefault<scalar>("iluDiagRelFloor", scalar(0));
+        const scalar iluDiagAbsFloorCfg = dict.lookupOrDefault<scalar>("iluDiagAbsFloor", diagFloorCfg);
+        const scalar iluDiagRelFloorCfg = dict.lookupOrDefault<scalar>("iluDiagRelFloor", scalar(0));
         const double iluDiagFloorEff = std::max(static_cast<double>(iluDiagAbsFloorCfg), static_cast<double>(iluDiagRelFloorCfg)*static_cast<double>(maxAbsDiag));
 
         if (useIC || useILU)
@@ -1676,9 +2241,9 @@ using DeviceScalar = double;
                 if (cusparseCreateCsrilu02Info(&iluInfo) == CUSPARSE_STATUS_SUCCESS)
                 {
                     // Optional numeric boost to avoid zero pivots
-                    const Switch iluNumericBoost = controlDict_.lookupOrDefault<Switch>("iluNumericBoost", Switch(false));
-                    const scalar iluBoostTolCfg = controlDict_.lookupOrDefault<scalar>("iluNumericBoostTol", diagFloorCfg);
-                    const scalar iluBoostValCfg = controlDict_.lookupOrDefault<scalar>("iluNumericBoostVal", diagFloorCfg);
+                    const Switch iluNumericBoost = dict.lookupOrDefault<Switch>("iluNumericBoost", Switch(false));
+                    const scalar iluBoostTolCfg = dict.lookupOrDefault<scalar>("iluNumericBoostTol", diagFloorCfg);
+                    const scalar iluBoostValCfg = dict.lookupOrDefault<scalar>("iluNumericBoostVal", diagFloorCfg);
                     double boostTol = static_cast<double>(iluBoostTolCfg);
                     double boostVal = static_cast<double>(iluBoostValCfg);
                     int bs = 0;
@@ -2375,7 +2940,7 @@ using DeviceScalar = double;
         else if (useComposite && icReady && (colourOperational && colourReady))
         {
             // Composite: a few coloured sweeps, then IC0
-            const label sweeps = std::max<label>(1, controlDict_.lookupOrDefault<label>("compositeColourSweeps", 2));
+            const label sweeps = std::max<label>(1, dict.lookupOrDefault<label>("compositeColourSweeps", 2));
             // First sweep: rhs -> out
             if (!applyColourDevice(rhs, out, "compColour1"))
             {
@@ -2896,6 +3461,14 @@ using DeviceScalar = double;
 
     solverPerf.initialResidual() = sumAbs/normFactor;
     solverPerf.finalResidual() = solverPerf.initialResidual();
+    bestResidualSoFar = solverPerf.initialResidual();
+    if (earlyAbortOnStall)
+    {
+        residualWindow.clear();
+        residualWindow.push_back(solverPerf.initialResidual());
+        stallInitCounter = 0;
+        stallWindowCounter = 0;
+    }
 
     if (logResidualTrajectory)
     {
@@ -2919,6 +3492,10 @@ using DeviceScalar = double;
         }
         cleanup();
         writeTelemetry(true, word::null);
+        if (useColour && autoTuneEnabled(dict))
+        {
+            colourAutoTuneRecordSuccess(fieldName_);
+        }
         return true;
     }
 
@@ -3078,24 +3655,69 @@ using DeviceScalar = double;
             const scalar initRes = solverPerf.initialResidual();
             if (initRes > VSMALL)
             {
-                scalar ratio = solverPerf.finalResidual()/initRes;
-                if (!std::isfinite(ratio))
+                const scalar ratioInit = solverPerf.finalResidual()/initRes;
+                if (!std::isfinite(ratioInit))
                 {
                     return fail("stallDetected");
                 }
-                if (ratio > stallRatioTol)
+                if (ratioInit > stallRatioTol)
                 {
-                    ++stallCounter;
+                    ++stallInitCounter;
                 }
                 else
                 {
-                    stallCounter = 0;
+                    stallInitCounter = 0;
                 }
 
-                if (stallCounter >= stallWindow)
+                if (stallInitCounter >= stallWindow)
                 {
                     return fail("stallDetected");
                 }
+            }
+
+            if (solverPerf.finalResidual() < bestResidualSoFar)
+            {
+                bestResidualSoFar = solverPerf.finalResidual();
+            }
+
+            if (!residualWindow.empty())
+            {
+                scalar windowMin = residualWindow.front();
+                for (const scalar val : residualWindow)
+                {
+                    if (val < windowMin)
+                    {
+                        windowMin = val;
+                    }
+                }
+
+                if (windowMin > VSMALL)
+                {
+                    const scalar ratioWindow = solverPerf.finalResidual()/windowMin;
+                    if (!std::isfinite(ratioWindow))
+                    {
+                        return fail("stallDetected");
+                    }
+                    if (ratioWindow > stallBestRatioTol)
+                    {
+                        ++stallWindowCounter;
+                    }
+                    else
+                    {
+                        stallWindowCounter = 0;
+                    }
+
+                    if (stallWindowCounter >= stallBestWindow)
+                    {
+                        return fail("stallDetected");
+                    }
+                }
+            }
+
+            residualWindow.push_back(solverPerf.finalResidual());
+            if (residualWindow.size() > static_cast<std::size_t>(stallBestWindow))
+            {
+                residualWindow.pop_front();
             }
         }
 
@@ -3206,6 +3828,10 @@ using DeviceScalar = double;
             << " s, iterations=" << iterationCountStats
             << ", avgIter=" << avgIterSeconds << " s"
             << ", maxIter=" << iterationMaxSeconds << " s" << nl;
+    }
+    if (useColour && autoTuneEnabled(dict))
+    {
+        colourAutoTuneRecordSuccess(fieldName_);
     }
     return true;
 }

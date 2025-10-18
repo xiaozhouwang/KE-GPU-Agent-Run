@@ -9,6 +9,7 @@
 #include "OSspecific.H"
 #include "Pstream.H"
 #include "Time.H"
+#include "IStringStream.H"
 
 #include <algorithm>
 #include <cmath>
@@ -21,6 +22,16 @@
 #include <chrono>
 #include <deque>
 #include <unordered_map>
+#include <memory>
+#include <climits>
+#include <cstring>
+#include <array>
+#include <utility>
+#include <tuple>
+#include <random>
+#include <numeric>
+#include <unordered_set>
+#include "bandCompression.H"
 
 #ifdef FOAM_USE_CUDA
 #include <cuda_runtime.h>
@@ -51,6 +62,85 @@ inline std::string toLower(const std::string& s)
 
 #ifdef FOAM_USE_CUDA
 
+#if defined(ULLONG_MAX)
+static constexpr std::size_t hashMagic = 0x9e3779b97f4a7c15ULL;
+#else
+static constexpr std::size_t hashMagic = 0x9e3779b9;
+#endif
+
+inline std::size_t hashCombine(std::size_t seed, std::size_t value)
+{
+    seed ^= value + hashMagic + (seed << 6) + (seed >> 2);
+    return seed;
+}
+
+inline std::size_t hashDouble(double value)
+{
+    std::size_t hashBits = 0;
+    static_assert(sizeof(hashBits) >= sizeof(value), "size_t must be at least as large as double");
+    std::memcpy(&hashBits, &value, sizeof(value));
+    return hashBits;
+}
+
+template<class Iterator>
+inline std::size_t hashSequence(std::size_t seed, Iterator begin, Iterator end)
+{
+    for (Iterator it = begin; it != end; ++it)
+    {
+        seed = hashCombine(seed, static_cast<std::size_t>(*it));
+    }
+    return seed;
+}
+
+static void computeRuizScale
+(
+    const Foam::List<int>& rowPtr,
+    const Foam::List<int>& colInd,
+    const Foam::List<double>& values,
+    std::vector<double>& scaleOut,
+    const int sweeps = 2
+)
+{
+    const std::size_t rows = rowPtr.size() ? rowPtr.size() - 1 : 0;
+    scaleOut.assign(rows, 1.0);
+    std::vector<double> tmpScale(rows, 1.0);
+    const double eps = 1e-12;
+    for (int sweep = 0; sweep < sweeps; ++sweep)
+    {
+        for (std::size_t i = 0; i < rows; ++i)
+        {
+            double sum = 0.0;
+            const int start = rowPtr[i];
+            const int end = rowPtr[i + 1];
+            for (int idx = start; idx < end; ++idx)
+            {
+                const int j = colInd[idx];
+                const double a = std::abs(static_cast<double>(values[idx]));
+                sum += a * scaleOut[j];
+            }
+            sum *= std::max(scaleOut[i], eps);
+            double rowNorm = std::sqrt(std::max(sum, eps));
+            if (rowNorm <= eps)
+            {
+                rowNorm = 1.0;
+            }
+            tmpScale[i] = scaleOut[i]/rowNorm;
+        }
+        scaleOut.swap(tmpScale);
+    }
+}
+
+enum class PreconCacheKind : int
+{
+    Diagonal = 0,
+    IC0 = 1,
+    ILU0 = 2,
+    SGS = 3,
+    Colour = 4,
+    Chebyshev = 5,
+    AMG = 6
+};
+
 struct ColourOverrideEntry
 {
     bool baseInitialised = false;
@@ -75,6 +165,614 @@ ColourOverrideRegistry& colourOverrides()
 {
     static ColourOverrideRegistry registry;
     return registry;
+}
+
+struct PreconCacheKey
+{
+    std::size_t matrixPatternId = 0;
+    std::size_t scaleId = 0;
+    std::size_t permutationId = 0;
+    int deviceId = -1;
+    PreconCacheKind kind = PreconCacheKind::Diagonal;
+
+    bool operator==(const PreconCacheKey& other) const noexcept
+    {
+        return matrixPatternId == other.matrixPatternId
+            && scaleId == other.scaleId
+            && permutationId == other.permutationId
+            && deviceId == other.deviceId
+            && kind == other.kind;
+    }
+};
+
+struct PreconCacheKeyHash
+{
+    std::size_t operator()(const PreconCacheKey& key) const noexcept
+    {
+        std::size_t seed = 0;
+        seed = hashCombine(seed, key.matrixPatternId);
+        seed = hashCombine(seed, key.scaleId);
+        seed = hashCombine(seed, key.permutationId);
+        seed = hashCombine(seed, static_cast<std::size_t>(key.deviceId));
+        seed = hashCombine(seed, static_cast<std::size_t>(key.kind));
+        return seed;
+    }
+};
+
+struct PreconCacheEntry
+{
+    Foam::label capacity = 0;
+    double* d_sqrtDiag = nullptr;
+    double* d_invSqrtDiag = nullptr;
+    double* d_scaledResidual = nullptr;
+    double* d_scaledDirection = nullptr;
+    double* d_scaledAp = nullptr;
+    double* d_scaledTmp = nullptr;
+    double* d_ruizScale = nullptr;
+    double* d_ruizInvScale = nullptr;
+    Foam::label icCacheKeyId = 0;
+    Foam::label flooredCount = 0;
+    Foam::label invSqrtClampCount = 0;
+    double diagFloorApplied = 0.0;
+    double invSqrtClampLimit = 0.0;
+    double lambdaMin = 0.0;
+    double lambdaMax = 0.0;
+    bool lambdaReady = false;
+    Foam::label icCapacityNnz = 0;
+    double* d_icVals = nullptr;
+    csric02Info_t icInfo = nullptr;
+    bool icAnalysisReady = false;
+    size_t icBufferSize = 0;
+    void* icBuffer = nullptr;
+    Foam::label icShiftCounter = 0;
+    Foam::label icAnalysisReuseHits = 0;
+    Foam::label icFactorReuseHits = 0;
+    Foam::label icRefactorCount = 0;
+    bool icFactorValid = false;
+    bool icHadZeroPivot = false;
+    std::size_t cachedMatrixPatternId = 0;
+    std::size_t cachedScaleId = 0;
+    std::size_t cachedPermutationId = 0;
+    PreconCacheKind cachedKind = PreconCacheKind::Diagonal;
+    double cachedMatvecSign = 1.0;
+    double icFactorScale = 1.0;
+    double icApplyScale = 1.0;
+    Foam::label permutationSize = 0;
+    int* d_perm = nullptr;
+    bool permutationReady = false;
+    Foam::label icPatternRows = 0;
+    Foam::label icPatternNnz = 0;
+    int* d_icRowPtr = nullptr;
+    int* d_icColInd = nullptr;
+    bool icPatternReady = false;
+    bool permutationValidated = false;
+    bool permutationStructureValidated = false;
+    Foam::label icLastIterations = 0;
+    Foam::scalar icRollingMedian = 0;
+    std::deque<Foam::label> icIterationHistory;
+    std::vector<std::pair<double, Foam::label>> icShiftTrace;
+    bool ruizReady = false;
+    double ruizClampRatio = 0.0;
+    double ruizScaleMin = 1.0;
+    double ruizScaleMax = 1.0;
+    bool icUsedDiagonalScaling = false;
+    bool icUsedRuizScaling = false;
+    Foam::autoPtr<Foam::lduMatrix::solver> amgSolver;
+    Foam::scalarField amgHostR;
+    Foam::scalarField amgHostZ;
+    Foam::label amgApplyCount = 0;
+    Foam::scalar amgSetupMs = 0;
+    Foam::scalar amgApplyMs = 0;
+
+    ~PreconCacheEntry()
+    {
+        release();
+    }
+
+    void release()
+    {
+        if (d_sqrtDiag)
+        {
+            cudaFree(d_sqrtDiag);
+            d_sqrtDiag = nullptr;
+        }
+        if (d_invSqrtDiag)
+        {
+            cudaFree(d_invSqrtDiag);
+            d_invSqrtDiag = nullptr;
+        }
+        if (d_scaledResidual)
+        {
+            cudaFree(d_scaledResidual);
+            d_scaledResidual = nullptr;
+        }
+        if (d_scaledDirection)
+        {
+            cudaFree(d_scaledDirection);
+            d_scaledDirection = nullptr;
+        }
+        if (d_scaledAp)
+        {
+            cudaFree(d_scaledAp);
+            d_scaledAp = nullptr;
+        }
+        if (d_scaledTmp)
+        {
+            cudaFree(d_scaledTmp);
+            d_scaledTmp = nullptr;
+        }
+        if (d_ruizScale)
+        {
+            cudaFree(d_ruizScale);
+            d_ruizScale = nullptr;
+        }
+        if (d_ruizInvScale)
+        {
+            cudaFree(d_ruizInvScale);
+            d_ruizInvScale = nullptr;
+        }
+        if (d_perm)
+        {
+            cudaFree(d_perm);
+            d_perm = nullptr;
+        }
+        if (d_icRowPtr)
+        {
+            cudaFree(d_icRowPtr);
+            d_icRowPtr = nullptr;
+        }
+        if (d_icColInd)
+        {
+            cudaFree(d_icColInd);
+            d_icColInd = nullptr;
+        }
+        capacity = 0;
+        flooredCount = 0;
+        invSqrtClampCount = 0;
+        diagFloorApplied = 0.0;
+        invSqrtClampLimit = 0.0;
+        lambdaMin = 0.0;
+        lambdaMax = 0.0;
+        lambdaReady = false;
+        if (d_icVals)
+        {
+            cudaFree(d_icVals);
+            d_icVals = nullptr;
+        }
+        if (icBuffer)
+        {
+            cudaFree(icBuffer);
+            icBuffer = nullptr;
+        }
+        if (icInfo)
+        {
+            cusparseDestroyCsric02Info(icInfo);
+            icInfo = nullptr;
+        }
+        icCapacityNnz = 0;
+        icAnalysisReady = false;
+        icBufferSize = 0;
+        icShiftCounter = 0;
+        icAnalysisReuseHits = 0;
+        icFactorReuseHits = 0;
+        icRefactorCount = 0;
+        icFactorValid = false;
+        icHadZeroPivot = false;
+        icFactorScale = 1.0;
+        icApplyScale = 1.0;
+        cachedMatrixPatternId = 0;
+        cachedScaleId = 0;
+        cachedPermutationId = 0;
+        cachedKind = PreconCacheKind::Diagonal;
+        cachedMatvecSign = 1.0;
+        permutationSize = 0;
+        permutationReady = false;
+        icPatternRows = 0;
+        icPatternNnz = 0;
+        icPatternReady = false;
+        permutationValidated = false;
+        permutationStructureValidated = false;
+        icLastIterations = 0;
+        icRollingMedian = 0;
+        icIterationHistory.clear();
+        icShiftTrace.clear();
+        ruizReady = false;
+        ruizClampRatio = 0.0;
+        ruizScaleMin = 1.0;
+        ruizScaleMax = 1.0;
+        amgSolver.clear();
+        amgHostR.clear();
+        amgHostZ.clear();
+        amgApplyCount = 0;
+        amgSetupMs = 0;
+        amgApplyMs = 0;
+    }
+
+    bool ensureCapacity(Foam::label n)
+    {
+        if (n < 0)
+        {
+            n = 0;
+        }
+        if
+        (
+            capacity == n
+         && d_sqrtDiag
+         && d_invSqrtDiag
+         && d_scaledResidual
+         && d_scaledDirection
+         && d_scaledAp
+         && d_scaledTmp
+         && d_ruizScale
+         && d_ruizInvScale
+        )
+        {
+            return true;
+        }
+        release();
+        if (!n)
+        {
+            return true;
+        }
+        if
+        (
+            cudaMalloc(reinterpret_cast<void**>(&d_sqrtDiag), sizeof(double)*n) != cudaSuccess
+         || cudaMalloc(reinterpret_cast<void**>(&d_invSqrtDiag), sizeof(double)*n) != cudaSuccess
+         || cudaMalloc(reinterpret_cast<void**>(&d_scaledResidual), sizeof(double)*n) != cudaSuccess
+         || cudaMalloc(reinterpret_cast<void**>(&d_scaledDirection), sizeof(double)*n) != cudaSuccess
+         || cudaMalloc(reinterpret_cast<void**>(&d_scaledAp), sizeof(double)*n) != cudaSuccess
+         || cudaMalloc(reinterpret_cast<void**>(&d_scaledTmp), sizeof(double)*n) != cudaSuccess
+         || cudaMalloc(reinterpret_cast<void**>(&d_ruizScale), sizeof(double)*n) != cudaSuccess
+         || cudaMalloc(reinterpret_cast<void**>(&d_ruizInvScale), sizeof(double)*n) != cudaSuccess
+        )
+        {
+            release();
+            return false;
+        }
+        capacity = n;
+        return true;
+    }
+
+    bool ensureIcCapacity(Foam::label nnz)
+    {
+        if (nnz < 0)
+        {
+            nnz = 0;
+        }
+        if (icCapacityNnz == nnz && d_icVals)
+        {
+            return true;
+        }
+        if (d_icVals)
+        {
+            cudaFree(d_icVals);
+            d_icVals = nullptr;
+        }
+        icCapacityNnz = 0;
+        if (!nnz)
+        {
+            return true;
+        }
+        if
+        (
+            cudaMalloc
+            (
+                reinterpret_cast<void**>(&d_icVals),
+                sizeof(double)*nnz
+            ) != cudaSuccess
+        )
+        {
+            d_icVals = nullptr;
+            return false;
+        }
+        icCapacityNnz = nnz;
+        return true;
+    }
+
+    bool ensureIcBuffer(size_t bytes)
+    {
+        if (icBuffer && icBufferSize >= bytes)
+        {
+            return true;
+        }
+        if (icBuffer)
+        {
+            cudaFree(icBuffer);
+            icBuffer = nullptr;
+            icBufferSize = 0;
+        }
+        if (!bytes)
+        {
+            return true;
+        }
+        if (cudaMalloc(&icBuffer, bytes) != cudaSuccess)
+        {
+            icBuffer = nullptr;
+            return false;
+        }
+        icBufferSize = bytes;
+        return true;
+    }
+
+    void updateKeyMetadata
+    (
+        std::size_t matrixPatternId,
+        std::size_t scaleId,
+        std::size_t permutationId,
+        PreconCacheKind kindIn
+    )
+    {
+        cachedMatrixPatternId = matrixPatternId;
+        cachedScaleId = scaleId;
+        cachedPermutationId = permutationId;
+        cachedKind = kindIn;
+    }
+
+    void resetIcReuseState()
+    {
+        icFactorValid = false;
+        icHadZeroPivot = false;
+        icAnalysisReady = false;
+        icAnalysisReuseHits = 0;
+        icFactorReuseHits = 0;
+        icRefactorCount = 0;
+        icFactorScale = 1.0;
+        icApplyScale = 1.0;
+        permutationReady = false;
+        icPatternReady = false;
+        permutationValidated = false;
+        permutationStructureValidated = false;
+        icLastIterations = 0;
+        icRollingMedian = 0;
+        icIterationHistory.clear();
+        icShiftTrace.clear();
+    }
+
+    bool setPermutationData(const Foam::labelList& permutation)
+    {
+        permutationReady = false;
+        permutationValidated = false;
+        permutationStructureValidated = false;
+
+        if (permutation.empty())
+        {
+            if (d_perm)
+            {
+                cudaFree(d_perm);
+                d_perm = nullptr;
+            }
+            permutationSize = 0;
+            return true;
+        }
+
+        const Foam::label n = permutation.size();
+        Foam::List<int> permInt(n);
+        forAll(permInt, i)
+        {
+            permInt[i] = static_cast<int>(permutation[i]);
+        }
+
+        if (permutationSize != n || !d_perm)
+        {
+            if (d_perm)
+            {
+                cudaFree(d_perm);
+                d_perm = nullptr;
+            }
+            if (cudaMalloc(reinterpret_cast<void**>(&d_perm), sizeof(int)*n) != cudaSuccess)
+            {
+                d_perm = nullptr;
+                permutationSize = 0;
+                return false;
+            }
+            permutationSize = n;
+        }
+
+        if
+        (
+            cudaMemcpy
+            (
+                d_perm,
+                permInt.begin(),
+                sizeof(int)*n,
+                cudaMemcpyHostToDevice
+            ) != cudaSuccess
+        )
+        {
+            permutationReady = false;
+            return false;
+        }
+        permutationReady = true;
+        return true;
+    }
+
+    bool setIcPatternData
+    (
+        const Foam::labelList& rowPtrHost,
+        const Foam::labelList& colIndHost
+    )
+    {
+        icPatternReady = false;
+        permutationStructureValidated = false;
+
+        const Foam::label rows = rowPtrHost.size() ? rowPtrHost.size() - 1 : 0;
+        const Foam::label nnz = colIndHost.size();
+
+        if (!rows || !nnz)
+        {
+            if (d_icRowPtr)
+            {
+                cudaFree(d_icRowPtr);
+                d_icRowPtr = nullptr;
+            }
+            if (d_icColInd)
+            {
+                cudaFree(d_icColInd);
+                d_icColInd = nullptr;
+            }
+            icPatternRows = 0;
+            icPatternNnz = 0;
+            return true;
+        }
+
+        Foam::List<int> rowPtrInt(rows + 1);
+        for (Foam::label i = 0; i <= rows; ++i)
+        {
+            rowPtrInt[i] = static_cast<int>(rowPtrHost[i]);
+        }
+
+        Foam::List<int> colIndInt(nnz);
+        for (Foam::label i = 0; i < nnz; ++i)
+        {
+            colIndInt[i] = static_cast<int>(colIndHost[i]);
+        }
+
+        if (icPatternRows != rows || !d_icRowPtr)
+        {
+            if (d_icRowPtr)
+            {
+                cudaFree(d_icRowPtr);
+                d_icRowPtr = nullptr;
+            }
+            if
+            (
+                cudaMalloc
+                (
+                    reinterpret_cast<void**>(&d_icRowPtr),
+                    sizeof(int)*(rows + 1)
+                ) != cudaSuccess
+            )
+            {
+                d_icRowPtr = nullptr;
+                icPatternRows = 0;
+                icPatternNnz = 0;
+                return false;
+            }
+            icPatternRows = rows;
+        }
+
+        if (icPatternNnz != nnz || !d_icColInd)
+        {
+            if (d_icColInd)
+            {
+                cudaFree(d_icColInd);
+                d_icColInd = nullptr;
+            }
+            if
+            (
+                cudaMalloc
+                (
+                    reinterpret_cast<void**>(&d_icColInd),
+                    sizeof(int)*nnz
+                ) != cudaSuccess
+            )
+            {
+                if (d_icRowPtr && icPatternRows != rows)
+                {
+                    cudaFree(d_icRowPtr);
+                    d_icRowPtr = nullptr;
+                    icPatternRows = 0;
+                }
+                d_icColInd = nullptr;
+                icPatternNnz = 0;
+                return false;
+            }
+            icPatternNnz = nnz;
+        }
+
+        if
+        (
+            cudaMemcpy
+            (
+                d_icRowPtr,
+                rowPtrInt.begin(),
+                sizeof(int)*(rows + 1),
+                cudaMemcpyHostToDevice
+            ) != cudaSuccess
+         || cudaMemcpy
+            (
+                d_icColInd,
+                colIndInt.begin(),
+                sizeof(int)*nnz,
+                cudaMemcpyHostToDevice
+            ) != cudaSuccess
+        )
+        {
+            icPatternReady = false;
+            return false;
+        }
+
+        icPatternReady = true;
+        return true;
+    }
+
+    Foam::scalar computeMedian() const
+    {
+        if (icIterationHistory.empty())
+        {
+            return 0;
+        }
+        std::vector<Foam::label> sorted(icIterationHistory.begin(), icIterationHistory.end());
+        std::sort(sorted.begin(), sorted.end());
+        const std::size_t mid = sorted.size()/2;
+        if (sorted.size() % 2 == 0)
+        {
+            if (mid == 0 || mid >= sorted.size())
+            {
+                return static_cast<Foam::scalar>(sorted.front());
+            }
+            return static_cast<Foam::scalar>(sorted[mid - 1] + sorted[mid])*Foam::scalar(0.5);
+        }
+        return static_cast<Foam::scalar>(sorted[mid]);
+    }
+
+    void recordIterations(Foam::label iterations)
+    {
+        if (iterations <= 0)
+        {
+            return;
+        }
+        constexpr std::size_t window = 8;
+        icIterationHistory.push_back(iterations);
+        if (icIterationHistory.size() > window)
+        {
+            icIterationHistory.pop_front();
+        }
+        icLastIterations = iterations;
+        icRollingMedian = computeMedian();
+    }
+};
+
+using PreconCacheMap = std::unordered_map
+<
+    PreconCacheKey,
+    std::unique_ptr<PreconCacheEntry>,
+    PreconCacheKeyHash
+>;
+
+static std::mutex preconCacheMutex;
+static PreconCacheMap preconCache;
+
+static PreconCacheEntry& getPreconCacheEntry(const PreconCacheKey& key)
+{
+    std::lock_guard<std::mutex> guard(preconCacheMutex);
+    static std::size_t nextCacheKeyId = 1;
+    auto iter = preconCache.find(key);
+    if (iter == preconCache.end())
+    {
+        auto inserted = preconCache.emplace
+        (
+            key,
+            std::unique_ptr<PreconCacheEntry>(new PreconCacheEntry())
+        );
+        PreconCacheEntry& entry = *(inserted.first->second);
+        entry.icCacheKeyId = static_cast<Foam::label>(nextCacheKeyId++);
+        entry.updateKeyMetadata(key.matrixPatternId, key.scaleId, key.permutationId, key.kind);
+        return entry;
+    }
+    PreconCacheEntry& entry = *(iter->second);
+    entry.updateKeyMetadata(key.matrixPatternId, key.scaleId, key.permutationId, key.kind);
+    return entry;
 }
 
 inline bool autoTuneEnabled(const Foam::dictionary& dict)
@@ -547,6 +1245,280 @@ inline bool ensureDriverInitialised()
     );
 
     return driverInitStatus == CUDA_SUCCESS;
+}
+
+static const char* permutationKernelSource = R"(
+extern "C" __global__
+void permutationGather
+(
+    int n,
+    const int* __restrict__ perm,
+    const double* __restrict__ inVec,
+    double* __restrict__ outVec
+)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n)
+    {
+        return;
+    }
+    outVec[idx] = inVec[perm[idx]];
+}
+
+extern "C" __global__
+void permutationScatter
+(
+    int n,
+    const int* __restrict__ perm,
+    const double* __restrict__ inVec,
+    double* __restrict__ outVec
+)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n)
+    {
+        return;
+    }
+    outVec[perm[idx]] = inVec[idx];
+}
+)";
+
+struct PermutationKernelCacheEntry
+{
+    int major = 0;
+    int minor = 0;
+    CUmodule module = nullptr;
+    CUfunction gather = nullptr;
+    CUfunction scatter = nullptr;
+    bool ok = false;
+};
+
+static std::mutex permutationKernelMutex;
+static std::vector<PermutationKernelCacheEntry> permutationKernelCache;
+
+bool compilePermutationKernels
+(
+    const cudaDeviceProp& prop,
+    PermutationKernelCacheEntry& entry,
+    bool verbose
+)
+{
+    entry.major = prop.major;
+    entry.minor = prop.minor;
+    entry.module = nullptr;
+    entry.gather = nullptr;
+    entry.scatter = nullptr;
+    entry.ok = false;
+
+    if (!ensureDriverInitialised())
+    {
+        if (verbose)
+        {
+            WarningInFunction << "cuInit failed: " << cuStatusName(driverInitStatus) << Foam::endl;
+        }
+        return false;
+    }
+
+    nvrtcProgram prog = nullptr;
+    nvrtcResult nvRes = nvrtcCreateProgram
+    (
+        &prog,
+        permutationKernelSource,
+        "permutationKernel.cu",
+        0,
+        nullptr,
+        nullptr
+    );
+
+    if (nvRes != NVRTC_SUCCESS)
+    {
+        if (verbose)
+        {
+            WarningInFunction << "nvrtcCreateProgram failed: " << nvrtcStatusName(nvRes) << Foam::endl;
+        }
+        return false;
+    }
+
+    std::string archStr = std::string("--gpu-architecture=compute_")
+        + std::to_string(prop.major)
+        + std::to_string(prop.minor);
+
+    std::vector<const char*> compileOptions;
+    compileOptions.push_back(archStr.c_str());
+    compileOptions.push_back("--fmad=false");
+    compileOptions.push_back("--std=c++14");
+    compileOptions.push_back("-I/usr/include");
+    compileOptions.push_back("-I/usr/local/cuda/include");
+    compileOptions.push_back("-I/usr/include/x86_64-linux-gnu");
+
+    nvRes = nvrtcCompileProgram
+    (
+        prog,
+        static_cast<int>(compileOptions.size()),
+        compileOptions.data()
+    );
+
+    if (nvRes != NVRTC_SUCCESS)
+    {
+        if (verbose)
+        {
+            size_t logSize = 0;
+            nvrtcGetProgramLogSize(prog, &logSize);
+            std::string log(logSize, '\0');
+            nvrtcGetProgramLog(prog, &log[0]);
+            WarningInFunction
+                << "nvrtcCompileProgram failed (" << nvrtcStatusName(nvRes) << ")"
+                << Foam::nl << log.c_str() << Foam::endl;
+        }
+        nvrtcDestroyProgram(&prog);
+        return false;
+    }
+
+    size_t ptxSize = 0;
+    nvRes = nvrtcGetPTXSize(prog, &ptxSize);
+    if (nvRes != NVRTC_SUCCESS)
+    {
+        if (verbose)
+        {
+            WarningInFunction << "nvrtcGetPTXSize failed: " << nvrtcStatusName(nvRes) << Foam::endl;
+        }
+        nvrtcDestroyProgram(&prog);
+        return false;
+    }
+
+    std::string ptx(ptxSize, '\0');
+    nvRes = nvrtcGetPTX(prog, &ptx[0]);
+    nvrtcDestroyProgram(&prog);
+    if (nvRes != NVRTC_SUCCESS)
+    {
+        if (verbose)
+        {
+            WarningInFunction << "nvrtcGetPTX failed: " << nvrtcStatusName(nvRes) << Foam::endl;
+        }
+        return false;
+    }
+
+    CUresult cuRes =
+        cuModuleLoadDataEx
+        (
+            &entry.module,
+            static_cast<const void*>(ptx.data()),
+            0,
+            nullptr,
+            nullptr
+        );
+
+    if (cuRes != CUDA_SUCCESS)
+    {
+        if (verbose)
+        {
+            WarningInFunction << "cuModuleLoadDataEx failed: " << cuStatusName(cuRes) << Foam::endl;
+        }
+        entry.module = nullptr;
+        return false;
+    }
+
+    cuRes = cuModuleGetFunction(&entry.gather, entry.module, "permutationGather");
+    if (cuRes != CUDA_SUCCESS)
+    {
+        if (verbose)
+        {
+            WarningInFunction << "cuModuleGetFunction gather failed: " << cuStatusName(cuRes) << Foam::endl;
+        }
+        cuModuleUnload(entry.module);
+        entry.module = nullptr;
+        return false;
+    }
+
+    cuRes = cuModuleGetFunction(&entry.scatter, entry.module, "permutationScatter");
+    if (cuRes != CUDA_SUCCESS)
+    {
+        if (verbose)
+        {
+            WarningInFunction << "cuModuleGetFunction scatter failed: " << cuStatusName(cuRes) << Foam::endl;
+        }
+        cuModuleUnload(entry.module);
+        entry.module = nullptr;
+        entry.gather = nullptr;
+        return false;
+    }
+
+    entry.ok = true;
+    return true;
+}
+
+bool getPermutationKernels
+(
+    const int deviceId,
+    CUfunction& gather,
+    CUfunction& scatter,
+    bool verbose
+)
+{
+    std::lock_guard<std::mutex> guard(permutationKernelMutex);
+
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, deviceId) != cudaSuccess)
+    {
+        if (verbose)
+        {
+            WarningInFunction << "cudaGetDeviceProperties failed for device " << deviceId << Foam::endl;
+        }
+        return false;
+    }
+
+    for (const PermutationKernelCacheEntry& entry : permutationKernelCache)
+    {
+        if (entry.major == prop.major && entry.minor == prop.minor && entry.ok)
+        {
+            gather = entry.gather;
+            scatter = entry.scatter;
+            return true;
+        }
+    }
+
+    PermutationKernelCacheEntry entry;
+    if (!compilePermutationKernels(prop, entry, verbose))
+    {
+        return false;
+    }
+    permutationKernelCache.push_back(entry);
+    gather = entry.gather;
+    scatter = entry.scatter;
+    return true;
+}
+
+inline bool launchPermutationKernel
+(
+    CUfunction kernel,
+    int n,
+    CUdeviceptr perm,
+    CUdeviceptr inVec,
+    CUdeviceptr outVec,
+    CUstream stream
+)
+{
+    const unsigned blockSize = 256;
+    const unsigned gridSize = static_cast<unsigned>((n + blockSize - 1)/blockSize);
+    void* args[] =
+    {
+        &n,
+        &perm,
+        &inVec,
+        &outVec
+    };
+    CUresult cuRes =
+        cuLaunchKernel
+        (
+            kernel,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0,
+            stream,
+            args,
+            nullptr
+        );
+    return cuRes == CUDA_SUCCESS;
 }
 
 bool compileColourKernels
@@ -1156,6 +2128,11 @@ bool Foam::cudaPCG::gpuSolve
     fileName colourStatsFile =
         dict.lookupOrDefault<fileName>("colourStatsFile", fileName::null);
 
+    const label diagHistogramBinsCfg =
+        std::max<label>(0, dict.lookupOrDefault<label>("diagHistogramBins", 0));
+    fileName diagHistogramFile =
+        dict.lookupOrDefault<fileName>("diagHistogramFile", fileName::null);
+
     if (logResidualTrajectory && residualLogFile == fileName::null)
     {
         residualLogFile =
@@ -1186,7 +2163,30 @@ bool Foam::cudaPCG::gpuSolve
     scalar colourAvgSize = 0;
     label colourDisableCount = 0;
     std::vector<std::string> colourDisableEvents;
+    std::vector<scalar> diagHistogramQuantiles;
     bool colourFallbackTriggered = false;
+    bool colourSpdMode = false;
+    PreconCacheEntry* preconCacheEntry = nullptr;
+    bool chebyshevRequested = false;
+    bool chebyshevForced = false;
+    bool chebyshevSpdApplied = false;
+    bool chebyshevGuardrailTriggered = false;
+    bool chebyshevRestartAttempted = false;
+    bool chebyshevRestarted = false;
+    bool chebyshevDotGuardTriggered = false;
+    bool chebyshevClampGuardTriggered = false;
+    bool chebyshevClampGate = false;
+    bool icForced = false;
+    bool icAppliedThisSolve = false;
+    bool icDotGuardTriggered = false;
+    bool icEffectComputed = false;
+    double icPrecondEffect0 = 0.0;
+    scalar chebyshevLambdaMinUsed = 0;
+    scalar chebyshevLambdaMaxUsed = 0;
+    scalar chebyshevLambdaInflateUsed = scalar(1);
+    label chebyshevDegreeUsed = 0;
+    scalar chebyshevPrevResidual = -1;
+    label chebyshevGrowthCounter = 0;
 
     cudaStream_t computeStream = nullptr;
     cudaGraph_t spmvGraph = nullptr;
@@ -1234,33 +2234,276 @@ using DeviceScalar = double;
         values[i] = static_cast<DeviceScalar>(csrMatrix.values[i]);
     }
 
+    const Switch icUseDiagonalScalingSwitch =
+        dict.lookupOrDefault<Switch>("icUseDiagonalScaling", Switch(true));
+    const Switch icUseRuizScalingSwitch =
+        dict.lookupOrDefault<Switch>("icUseRuizScaling", Switch(true));
+    const Switch icUseRCMSwitch =
+        dict.lookupOrDefault<Switch>("icUseRCM", Switch(false));
+    const Switch icNormalizeFactorSwitch =
+        dict.lookupOrDefault<Switch>("icNormalizeFactor", Switch(true));
+    const Switch icDebugDump =
+        dict.lookupOrDefault<Switch>("icDebugDump", Switch(false));
+    const label icDebugIterLog =
+        dict.lookupOrDefault<label>("icDebugIterLog", label(3));
+    const bool icUseDiagonalScaling = icUseDiagonalScalingSwitch;
+    const bool icUseRuizScaling = icUseRuizScalingSwitch;
+    const bool icUseRCM = icUseRCMSwitch;
+    const bool icNormalizeFactor = icNormalizeFactorSwitch;
+    const scalar icNormalizeClampMinCfg =
+        dict.lookupOrDefault<scalar>("icNormalizeClampMin", scalar(1e-2));
+    const scalar icNormalizeClampMaxCfg =
+        dict.lookupOrDefault<scalar>("icNormalizeClampMax", scalar(10));
+    const scalar icNormalizeTargetEffectCfg =
+        dict.lookupOrDefault<scalar>("icNormalizeTargetEffect", scalar(1));
+    const scalar icDiagBoostFractionCfg =
+        dict.lookupOrDefault<scalar>("icDiagBoostFraction", scalar(0));
+    const scalar icDiagBoostMinCfg =
+        dict.lookupOrDefault<scalar>("icDiagBoostMin", scalar(0));
+    const scalar icDiagBoostMaxCfg =
+        dict.lookupOrDefault<scalar>("icDiagBoostMax", scalar(0));
+
+
+
+    std::size_t permutationId = 0;
+    Foam::labelList permutation;
+    Foam::labelList permutationInverse;
+    bool permutationActive = false;
+    if (icUseRCM)
+    {
+        Foam::labelList offsets(rows + 1);
+        for (int i = 0; i <= rows; ++i)
+        {
+            offsets[i] = rowPtr[i];
+        }
+        Foam::labelList adjacency(nnz);
+        for (int i = 0; i < nnz; ++i)
+        {
+            adjacency[i] = colInd[i];
+        }
+
+        Foam::labelList rcmOrder = bandCompression(adjacency, offsets);
+        if (rcmOrder.size() == rows)
+        {
+            permutation.setSize(rows);
+            permutationInverse.setSize(rows);
+            permutationActive = false;
+            for (Foam::label newIdx = 0; newIdx < rows; ++newIdx)
+            {
+                const Foam::label origIdx = rcmOrder[newIdx];
+                permutation[newIdx] = origIdx;
+                permutationInverse[origIdx] = newIdx;
+                if (!permutationActive && origIdx != newIdx)
+                {
+                    permutationActive = true;
+                }
+            }
+            if (!permutationActive)
+            {
+                permutation.clear();
+                permutationInverse.clear();
+            }
+            else
+            {
+                permutationId = hashSequence(static_cast<std::size_t>(0), permutation.begin(), permutation.end());
+            }
+        }
+    }
+
+    std::size_t matrixPatternId = hashSequence(static_cast<std::size_t>(rows), rowPtr.begin(), rowPtr.end());
+    matrixPatternId = hashSequence(matrixPatternId, colInd.begin(), colInd.end());
+
     const scalarField& diag = matrix_.diag();
     const scalar diagFloorAbsCfg =
         dict.lookupOrDefault<scalar>("preconditionerDiagFloor", scalar(1e-20));
     const scalar diagFloorRelCfg =
-        dict.lookupOrDefault<scalar>("preconditionerDiagRelFloor", scalar(0));
+        dict.lookupOrDefault<scalar>("preconditionerDiagRelFloor", scalar(1e-10));
+    const scalar invSqrtClampCfg =
+        dict.lookupOrDefault<scalar>("preconditionerInvSqrtClamp", scalar(1e4));
+    const scalar diagQuantileFracCfg =
+        max(scalar(0), dict.lookupOrDefault<scalar>("preconditionerDiagQuantile", scalar(0.01)));
+    const scalar diagQuantileAlphaCfg =
+        dict.lookupOrDefault<scalar>("preconditionerDiagQuantileAlpha", scalar(0.5));
+    const scalar invSqrtClampSafetyCfg =
+        dict.lookupOrDefault<scalar>("preconditionerInvSqrtClampSafety", scalar(1));
+    const scalar invSqrtClampMaxCfg =
+        dict.lookupOrDefault<scalar>("preconditionerInvSqrtClampMax", scalar(1e5));
+    const Switch diagSnapshotEnable =
+        dict.lookupOrDefault<Switch>("preconditionerDiagSnapshot", Switch(false));
+    const scalar diagSnapshotClampRatioCfg =
+        dict.lookupOrDefault<scalar>("preconditionerDiagSnapshotClampRatio", scalar(0.01));
+    const fileName diagSnapshotFileCfg =
+        dict.lookupOrDefault<fileName>("preconditionerDiagSnapshotFile", fileName::null);
 
     scalar minDiag = std::numeric_limits<scalar>::max();
     scalar maxDiag = -std::numeric_limits<scalar>::max();
     scalar maxAbsDiag = 0;
+    std::vector<scalar> absDiagVals;
+    absDiagVals.reserve(diag.size());
     for (const scalar d : diag)
     {
         minDiag = std::min(minDiag, d);
         maxDiag = std::max(maxDiag, d);
-        maxAbsDiag = std::max(maxAbsDiag, mag(d));
+        const scalar absVal = mag(d);
+        maxAbsDiag = std::max(maxAbsDiag, absVal);
+        absDiagVals.push_back(absVal);
     }
 
-    const scalar diagFloorCfg = std::max(diagFloorAbsCfg, diagFloorRelCfg*maxAbsDiag);
+    scalar medianAbsDiag = 0;
+    if (!absDiagVals.empty())
+    {
+        std::sort(absDiagVals.begin(), absDiagVals.end());
+        const label midIdx = static_cast<label>(absDiagVals.size()/2);
+        if (absDiagVals.size() % 2 == 0)
+        {
+            const scalar upperMid = absDiagVals[midIdx];
+            const scalar lowerMid =
+                midIdx > 0 ? absDiagVals[midIdx - 1] : absDiagVals[midIdx];
+            medianAbsDiag = scalar(0.5)*(upperMid + lowerMid);
+        }
+        else
+        {
+            medianAbsDiag = absDiagVals[midIdx];
+        }
+    }
+
+    const scalar matvecSignCfg = dict.lookupOrDefault<scalar>("matvecSign", scalar(-1));
+    const scalar matvecSign = matvecSignCfg >= scalar(0) ? scalar(1) : scalar(-1);
+    const double matvecSignD = static_cast<double>(matvecSign);
+
+    scalar diagFloorCfg = diagFloorAbsCfg;
+    scalar diagQuantileValue = 0;
+    if (!absDiagVals.empty() && diagQuantileFracCfg > scalar(0))
+    {
+        const scalar clampedFrac = std::min(std::max(diagQuantileFracCfg, scalar(0)), scalar(0.5));
+        const scalar position = clampedFrac * scalar(absDiagVals.size() - 1);
+        const label lowerIdx = static_cast<label>(std::max(scalar(0), std::floor(position)));
+        const label upperIdx = static_cast<label>(std::min(scalar(absDiagVals.size() - 1), std::ceil(position)));
+        const scalar weight = position - scalar(lowerIdx);
+        const scalar lowerVal = absDiagVals[lowerIdx];
+        const scalar upperVal = absDiagVals[upperIdx];
+        diagQuantileValue = (1 - weight)*lowerVal + weight*upperVal;
+    }
+    if (diagHistogramBinsCfg > 0 && !absDiagVals.empty())
+    {
+        const label bins = diagHistogramBinsCfg;
+        diagHistogramQuantiles.clear();
+        diagHistogramQuantiles.reserve(bins + 1);
+        for (label i = 0; i <= bins; ++i)
+        {
+            const scalar fraction = bins ? scalar(i)/scalar(bins) : scalar(0);
+            const scalar position = fraction * scalar(absDiagVals.size() - 1);
+            const label lowerIdx = static_cast<label>(std::max(scalar(0), std::floor(position)));
+            const label upperIdx = static_cast<label>(std::min(scalar(absDiagVals.size() - 1), std::ceil(position)));
+            const scalar weight = position - scalar(lowerIdx);
+            const scalar lowerVal = absDiagVals[lowerIdx];
+            const scalar upperVal = absDiagVals[upperIdx];
+            diagHistogramQuantiles.push_back((1 - weight)*lowerVal + weight*upperVal);
+        }
+    }
+    if (diagFloorRelCfg > scalar(0))
+    {
+        const scalar relReference =
+            (medianAbsDiag > VSMALL) ? medianAbsDiag : maxAbsDiag;
+        diagFloorCfg = std::max(diagFloorCfg, diagFloorRelCfg*relReference);
+    }
+    if (diagQuantileValue > scalar(0) && diagQuantileAlphaCfg > scalar(0))
+    {
+        diagFloorCfg = std::max(diagFloorCfg, diagQuantileAlphaCfg*diagQuantileValue);
+    }
+    if (diagFloorCfg <= scalar(0))
+    {
+        diagFloorCfg = std::max(diagFloorAbsCfg, scalar(1e-20));
+    }
 
     const labelUList& upperAddr = matrix_.lduAddr().upperAddr();
     const labelUList& lowerAddr = matrix_.lduAddr().lowerAddr();
     const scalarField& upper = matrix_.upper();
 
     scalarField dicDiag(diag);
+    label numFlooredDiag = 0;
     forAll(dicDiag, i)
     {
         scalar& d = dicDiag[i];
-        d = std::max(mag(d), diagFloorCfg);
+        const scalar absVal = mag(d);
+        if (absVal < diagFloorCfg)
+        {
+            ++numFlooredDiag;
+        }
+        d = std::max(absVal, diagFloorCfg);
+    }
+
+    scalar dicDiagMedianPreBoost = scalar(0);
+    if
+    (
+        (icDiagBoostFractionCfg > scalar(0))
+     || (icDiagBoostMinCfg > scalar(0))
+     || (icDiagBoostMaxCfg > scalar(0))
+    )
+    {
+        std::vector<scalar> dicDiagAbs;
+        dicDiagAbs.reserve(dicDiag.size());
+        forAll(dicDiag, i)
+        {
+            const scalar absVal = mag(dicDiag[i]);
+            if (absVal > VSMALL)
+            {
+                dicDiagAbs.push_back(absVal);
+            }
+        }
+        if (!dicDiagAbs.empty())
+        {
+            const auto computeMedianScalar = [](std::vector<scalar>& data) -> scalar
+            {
+                const std::size_t mid = data.size()/2;
+                std::nth_element(data.begin(), data.begin() + mid, data.end());
+                scalar median = data[mid];
+                if (data.size() % 2 == 0 && mid > 0)
+                {
+                    std::nth_element(data.begin(), data.begin() + mid - 1, data.end());
+                    median = scalar(0.5)*(median + data[mid - 1]);
+                }
+                return median;
+            };
+            dicDiagMedianPreBoost = computeMedianScalar(dicDiagAbs);
+            scalar boostTarget = scalar(0);
+            if (icDiagBoostFractionCfg > scalar(0) && dicDiagMedianPreBoost > VSMALL)
+            {
+                boostTarget = icDiagBoostFractionCfg * dicDiagMedianPreBoost;
+            }
+            scalar diagBoost = std::max(icDiagBoostMinCfg, boostTarget);
+            if (icDiagBoostMaxCfg > scalar(0))
+            {
+                diagBoost = std::min(diagBoost, icDiagBoostMaxCfg);
+            }
+            if (diagBoost > scalar(0))
+            {
+                forAll(dicDiag, i)
+                {
+                    dicDiag[i] += diagBoost;
+                }
+                if (reportStats && (!Pstream::parRun() || Pstream::master()))
+                {
+                    scalar minPre = dicDiagAbs.front();
+                    scalar maxPre = dicDiagAbs.front();
+                    for (scalar val : dicDiagAbs)
+                    {
+                        minPre = std::min(minPre, val);
+                        maxPre = std::max(maxPre, val);
+                    }
+                    Info<< "cudaPCG(" << fieldName_ << "): IC diag boost delta="
+                        << diagBoost
+                        << " medianPre=" << dicDiagMedianPreBoost
+                        << " rangePre=[" << minPre << ',' << maxPre << ']'
+                        << nl;
+                }
+            }
+        }
+        else if (reportStats && (!Pstream::parRun() || Pstream::master()))
+        {
+            Info<< "cudaPCG(" << fieldName_ << "): IC diag boost skipped (no positive entries)"
+                << nl;
+        }
     }
 
     const label nFaces = upper.size();
@@ -1277,6 +2520,34 @@ using DeviceScalar = double;
     scalar maxDiagReg = -std::numeric_limits<scalar>::max();
     List<DeviceScalar> precondDiag(dicDiag.size());
     List<DeviceScalar> diagInv(dicDiag.size());
+    label invSqrtClamped = 0;
+    double invSqrtClampUsed = static_cast<double>(invSqrtClampCfg);
+    double icDiagMedianScaled = std::max(static_cast<double>(diagFloorCfg), static_cast<double>(medianAbsDiag));
+    if (invSqrtClampUsed > 0 && diagFloorCfg > scalar(0))
+    {
+        const double diagClamp = 1.0/std::sqrt(static_cast<double>(diagFloorCfg));
+        invSqrtClampUsed = std::max
+        (
+            invSqrtClampUsed,
+            static_cast<double>(invSqrtClampSafetyCfg) * diagClamp
+        );
+    }
+    if (diagQuantileValue > scalar(0) && invSqrtClampUsed > 0)
+    {
+        const double quantClamp =
+            static_cast<double>(invSqrtClampSafetyCfg)
+          / std::sqrt(std::max(static_cast<double>(diagQuantileValue), double(VSMALL)));
+        invSqrtClampUsed = std::max(invSqrtClampUsed, quantClamp);
+    }
+    if (invSqrtClampMaxCfg > scalar(0))
+    {
+        invSqrtClampUsed = std::min
+        (
+            invSqrtClampUsed,
+            static_cast<double>(invSqrtClampMaxCfg)
+        );
+    }
+    scalar invSqrtClampRatio = 0;
 
     forAll(dicDiag, i)
     {
@@ -1289,10 +2560,50 @@ using DeviceScalar = double;
             : static_cast<DeviceScalar>(0);
     }
 
-    if (reportStats)
+    if (reportStats && (!Pstream::parRun() || Pstream::master()))
     {
-        Info<< "cudaPCG: diagonal range [" << minDiag << ", " << maxDiag << "]"
-            << " (regularised [" << minDiagReg << ", " << maxDiagReg << "])" << nl;
+        auto computeMedianLocal = [](std::vector<double>& data) -> double
+        {
+            if (data.empty())
+            {
+                return 0.0;
+            }
+            std::size_t mid = data.size()/2;
+            std::nth_element(data.begin(), data.begin() + mid, data.end());
+            double median = data[mid];
+            if (data.size() % 2 == 0 && mid > 0)
+            {
+                std::nth_element(data.begin(), data.begin() + mid - 1, data.end());
+                median = 0.5*(median + data[mid - 1]);
+            }
+            return median;
+        };
+
+        double dicMin = std::numeric_limits<double>::max();
+        double dicMax = -std::numeric_limits<double>::max();
+        std::vector<double> dicPos;
+        dicPos.reserve(precondDiag.size());
+        forAll(precondDiag, i)
+        {
+            const double val = static_cast<double>(precondDiag[i]);
+            dicMin = std::min(dicMin, val);
+            dicMax = std::max(dicMax, val);
+            if (val > 0.0)
+            {
+                dicPos.push_back(val);
+            }
+        }
+        const double dicMedian = computeMedianLocal(dicPos);
+        const double flooredFrac =
+            rows > 0 ? static_cast<double>(numFlooredDiag)/static_cast<double>(rows) : 0.0;
+        Info<< "cudaPCG(" << fieldName_ << "): dicDiag stats "
+            << "min=" << dicMin
+            << " max=" << dicMax
+            << " median=" << dicMedian
+            << " floored=" << numFlooredDiag
+            << " flooredFrac=" << flooredFrac
+            << " invSqrtClampUsed=" << invSqrtClampUsed
+            << nl;
     }
 
     DeviceScalar *d_vals=nullptr, *d_x=nullptr, *d_b=nullptr;
@@ -1311,6 +2622,16 @@ using DeviceScalar = double;
     cusparseSpSVDescr_t spsvLowerIlu = nullptr, spsvUpperIlu = nullptr;
     cusparseSpSVDescr_t spsvLowerChol = nullptr, spsvUpperTChol = nullptr;
     void* iluBuf = nullptr; size_t iluBufSize = 0;
+    bool d_iluValsFromCache = false;
+    bool icInfoFromCache = false;
+    bool icBufferFromCache = false;
+    List<DeviceScalar> sqrtDiagHost;
+    List<DeviceScalar> invSqrtDiagHost;
+    double scaledRowSumMax = 0.0;
+    bool scaledRowSumReady = false;
+    Foam::label amgApplyCountTotal = 0;
+    Foam::scalar amgSetupMsTotal = 0;
+    Foam::scalar amgApplyMsTotal = 0;
 
     // Preconditioner configuration
     const word preconditionerWord = dict.lookupOrDefault<word>("preconditioner", word("diagonal"));
@@ -1321,6 +2642,12 @@ using DeviceScalar = double;
     bool useILU = false;
     bool useIC = false;
     bool useComposite = false;
+    bool useChebyshev = false;
+    bool useAmg = false;
+
+    const word forcePreconditionerWord =
+        dict.lookupOrDefault<word>("forcePreconditioner", word::null);
+    const std::string forcePreconLower = toLower(forcePreconditionerWord);
 
     if
     (
@@ -1350,9 +2677,54 @@ using DeviceScalar = double;
         // Map DIC to IC0 on GPU for closer parity with CPU
         useIC = true;
     }
+    else if (precondLower == "chebyshev" || precondLower == "cheb")
+    {
+        useChebyshev = true;
+        chebyshevRequested = true;
+    }
+    else if (precondLower == "amg")
+    {
+        useAmg = true;
+    }
     if (precondLower == "composite" || precondLower.find("colour+ic") != std::string::npos || precondLower.find("color+ic") != std::string::npos)
     {
         useComposite = true;
+    }
+
+    if (forcePreconLower == "sgs_spd")
+    {
+        useColour = true;
+        useSGS = false;
+        useILU = false;
+        useIC = false;
+        useComposite = false;
+        colourSpdMode = true;
+    }
+    else if (forcePreconLower == "cheb_spd")
+    {
+        useColour = false;
+        useSGS = false;
+        useILU = false;
+        useIC = false;
+        useComposite = false;
+        useChebyshev = true;
+        chebyshevRequested = true;
+        chebyshevForced = true;
+    }
+    else if
+    (
+        forcePreconLower == "ic0"
+     || forcePreconLower == "ic"
+     || forcePreconLower == "dic"
+    )
+    {
+        useColour = false;
+        useSGS = false;
+        useILU = false;
+        useComposite = false;
+        useChebyshev = false;
+        useIC = true;
+        icForced = true;
     }
 
     colourInitiallyRequested = useColour;
@@ -1360,7 +2732,7 @@ using DeviceScalar = double;
     label polySweepsCfg = dict.lookupOrDefault<label>("polyJacobiSweeps", 0);
     scalar jacOmegaCfg = dict.lookupOrDefault<scalar>("jacobiOmega", scalar(0.7));
     const Switch polyAuto = dict.lookupOrDefault<Switch>("polyJacobiAuto", Switch(true));
-    bool usePolyJacobi = (!useColour && !useSGS && !useILU && !useIC) && ((polySweepsCfg > 0) || polyAuto);
+    bool usePolyJacobi = (!useColour && !useSGS && !useILU && !useIC && !useChebyshev && !useAmg) && ((polySweepsCfg > 0) || polyAuto);
     label polySweepsEff = polySweepsCfg;
     double jacOmegaEff = static_cast<double>(jacOmegaCfg);
 
@@ -1390,10 +2762,21 @@ using DeviceScalar = double;
     const scalar baseColourOmega = colourOmegaCfg;
     const scalar baseColourBackward = colourBackwardOmegaCfg;
     const scalar baseColourDiag = colourDiagFloorCfg;
-    if (useColour)
+    if (colourSpdMode)
+    {
+        colourOmegaCfg = scalar(1);
+        colourBackwardOmegaCfg = scalar(1);
+    }
+    const bool buildColour = useColour || colourSpdMode || useChebyshev;
+
+    if (buildColour)
     {
         int colourStage = 0;
-        if (autoTuneEnabled(dict))
+        if (colourSpdMode)
+        {
+            colourAutoTuneReset(fieldName_);
+        }
+        else if (useColour && autoTuneEnabled(dict))
         {
             colourAutoTuneSetup
             (
@@ -1419,15 +2802,27 @@ using DeviceScalar = double;
                 stallBestRatioTol
             );
         }
+        else if (useColour)
+        {
+            colourAutoTuneReset(fieldName_);
+        }
         else
         {
             colourAutoTuneReset(fieldName_);
+        }
+
+        if (colourSpdMode)
+        {
+            colourOmegaCfg = scalar(1);
+            colourBackwardOmegaCfg = scalar(1);
         }
     }
     else if (autoTuneEnabled(dict))
     {
         colourAutoTuneReset(fieldName_);
     }
+    const int autoTuneStage = colourAutoTuneStage(fieldName_);
+
     const label colourBlockSizeCfg =
         std::max<label>
         (
@@ -1436,6 +2831,23 @@ using DeviceScalar = double;
         );
     const bool colourVerbose =
         dict.lookupOrDefault<Switch>("colourVerbose", Switch(false));
+
+    scalar chebyshevLambdaMinFloor = scalar(1e-6);
+    scalar chebyshevLambdaInflate = scalar(1.5);
+    scalar chebyshevClampRatioLimit =
+        dict.lookupOrDefault<scalar>("chebyshevInvSqrtClampRatio", scalar(0.01));
+    label chebyshevDegree = 0;
+    if (useChebyshev)
+    {
+        chebyshevLambdaMinFloor =
+            dict.lookupOrDefault<scalar>("chebyshevLambdaMinFloor", scalar(1e-6));
+        chebyshevLambdaInflate =
+            dict.lookupOrDefault<scalar>("chebyshevLambdaInflate", scalar(1.5));
+        chebyshevLambdaInflateUsed = chebyshevLambdaInflate;
+        const label chebyshevDegreeDefault = (autoTuneStage <= 0) ? 2 : 3;
+        chebyshevDegree = chebyshevDegreeDefault;
+        chebyshevDegreeUsed = chebyshevDegree;
+    }
 
     const double colourOmegaEff = std::max(0.0, std::min(1.0, static_cast<double>(colourOmegaCfg)));
     const double colourBackwardOmegaEff = std::max(0.0, std::min(1.0, static_cast<double>(colourBackwardOmegaCfg)));
@@ -1611,6 +3023,14 @@ using DeviceScalar = double;
             os.precision(IOstream::defaultPrecision());
             os<< "# cudaPCG residual trajectory for " << fieldName_ << nl;
             os<< "# success," << (success ? "true" : "false") << nl;
+            os<< "# chebRestarted," << (chebyshevRestarted ? "true" : "false") << nl;
+            os<< "# chebClampGate," << (chebyshevClampGate ? "true" : "false") << nl;
+            os<< "# invSqrtClampRatio," << invSqrtClampRatio << nl;
+            os<< "# icDotGuard," << (icDotGuardTriggered ? "true" : "false") << nl;
+            if (icEffectComputed)
+            {
+                os<< "# icPrecondEffect0," << icPrecondEffect0 << nl;
+            }
             if (failureMessage.size())
             {
                 os<< "# failure," << failureMessage << nl;
@@ -1621,6 +3041,61 @@ using DeviceScalar = double;
                 os<< residualIterHistory[i] << ',' << residualValueHistory[i] << nl;
             }
             Info<< "cudaPCG(" << fieldName_ << "): residual log -> " << resolved << nl;
+        }
+
+        if (amgApplyCountTotal > 0 && reportStats)
+        {
+            const scalar avgApply = amgApplyCountTotal
+                ? amgApplyMsTotal/static_cast<scalar>(amgApplyCountTotal)
+                : scalar(0);
+            Info<< "cudaPCG(" << fieldName_ << "): AMG applyCount="
+                << amgApplyCountTotal
+                << " setupMs=" << amgSetupMsTotal
+                << " applyMs=" << amgApplyMsTotal
+                << " avgApplyMs=" << avgApply << nl;
+        }
+
+        if (diagHistogramBinsCfg > 0 && !diagHistogramQuantiles.empty() && master)
+        {
+            fileName resolved = diagHistogramFile;
+            if (resolved == fileName::null)
+            {
+                resolved = fileName("postProcessing/cudaPCG/" + fieldName_ + "_diag.csv");
+            }
+            resolved = resolvePath(resolved);
+            const fileName parent = resolved.path();
+            if (!parent.empty())
+            {
+                mkDir(parent);
+            }
+            OFstream os(resolved);
+            os.setf(std::ios::scientific);
+            os.precision(IOstream::defaultPrecision());
+            os<< "# cudaPCG diagonal histogram for " << fieldName_ << nl;
+            os<< "# success," << (success ? "true" : "false") << nl;
+            os<< "# chebRestarted," << (chebyshevRestarted ? "true" : "false") << nl;
+            os<< "# chebClampGate," << (chebyshevClampGate ? "true" : "false") << nl;
+            os<< "# invSqrtClampRatio," << invSqrtClampRatio << nl;
+            os<< "# icDotGuard," << (icDotGuardTriggered ? "true" : "false") << nl;
+            if (icEffectComputed)
+            {
+                os<< "# icPrecondEffect0," << icPrecondEffect0 << nl;
+            }
+            os<< "# quantileFrac," << diagQuantileFracCfg << nl;
+            os<< "# quantileAbs," << diagQuantileValue << nl;
+            if (failureMessage.size())
+            {
+                os<< "# failure," << failureMessage << nl;
+            }
+            os<< "fraction,absDiag" << nl;
+            for (label i = 0; i < static_cast<label>(diagHistogramQuantiles.size()); ++i)
+            {
+                const scalar fraction = diagHistogramBinsCfg
+                    ? scalar(i)/scalar(diagHistogramBinsCfg)
+                    : scalar(0);
+                os<< fraction << ',' << diagHistogramQuantiles[i] << nl;
+            }
+            Info<< "cudaPCG(" << fieldName_ << "): diag histogram -> " << resolved << nl;
         }
 
         const bool colourActiveFinal = useColour && colourOperational;
@@ -1650,6 +3125,7 @@ using DeviceScalar = double;
                 << " omegaF=" << colourOmegaEff
                 << " omegaB=" << colourBackwardOmegaEff
                 << " diagFloor=" << colourDiagFloor
+                << " spdMode=" << (colourSpdMode ? "true" : "false")
                 << " built=" << (colourBuiltSuccessfully ? "true" : "false")
                 << " applied=" << (colourAppliedSuccessfully ? "true" : "false")
                 << " activeFinal=" << (colourActiveFinal ? "true" : "false")
@@ -1683,7 +3159,7 @@ using DeviceScalar = double;
             {
                 os<< "# failure," << failureMessage << nl;
             }
-            os<< "nColours,minSize,maxSize,avgSize,diagFloor,omegaForward,omegaBackward,diagMin,diagMax,built,applied,activeFinal,disableCount,disableStages" << nl;
+            os<< "nColours,minSize,maxSize,avgSize,diagFloor,omegaForward,omegaBackward,diagMin,diagMax,built,applied,activeFinal,disableCount,disableStages,colourSpd" << nl;
             os<< colourSetCount << ','
                << colourMinSize << ','
                << colourMaxSize << ','
@@ -1701,7 +3177,7 @@ using DeviceScalar = double;
             {
                 os<< disableSummary.str();
             }
-            os<< nl;
+            os<< ',' << (colourSpdMode ? 1 : 0) << nl;
             Info<< "cudaPCG(" << fieldName_ << "): colour stats -> " << resolved << nl;
         }
     };
@@ -1770,11 +3246,11 @@ using DeviceScalar = double;
         if (spsvUpperIlu) cusparseSpSV_destroyDescr(spsvUpperIlu);
         if (spsvLowerChol) cusparseSpSV_destroyDescr(spsvLowerChol);
         if (spsvUpperTChol) cusparseSpSV_destroyDescr(spsvUpperTChol);
-        if (iluBuf) cudaFree(iluBuf);
+        if (iluBuf && !icBufferFromCache) cudaFree(iluBuf);
         if (iluInfo) cusparseDestroyCsrilu02Info(iluInfo);
-        if (icInfo) cusparseDestroyCsric02Info(icInfo);
+        if (icInfo && !icInfoFromCache) cusparseDestroyCsric02Info(icInfo);
         if (iluDescr) cusparseDestroyMatDescr(iluDescr);
-        if (d_iluVals) cudaFree(d_iluVals);
+        if (d_iluVals && !d_iluValsFromCache) cudaFree(d_iluVals);
         if (spmvGraphExec)
         {
             cudaGraphExecDestroy(spmvGraphExec);
@@ -1798,6 +3274,1241 @@ using DeviceScalar = double;
         message = msg;
         writeTelemetry(false, msg);
         return false;
+    };
+
+    if (precondDiag.size())
+    {
+        sqrtDiagHost.setSize(rows);
+        invSqrtDiagHost.setSize(rows);
+        double invSqrtClampEffective = icUseDiagonalScaling ? invSqrtClampUsed : 0.0;
+        label invSqrtClampLocal = 0;
+        if (icUseDiagonalScaling)
+        {
+            for (int i = 0; i < rows; ++i)
+            {
+                const double reg = static_cast<double>(precondDiag[i]);
+                const double sqrtVal = reg > 0 ? std::sqrt(reg) : 1.0;
+                sqrtDiagHost[i] = static_cast<DeviceScalar>(sqrtVal);
+                double invSqrt = (sqrtVal > VSMALL) ? 1.0/sqrtVal : 0.0;
+                if (invSqrt > invSqrtClampEffective)
+                {
+                    invSqrt = invSqrtClampEffective;
+                    ++invSqrtClampLocal;
+                }
+                invSqrtDiagHost[i] = static_cast<DeviceScalar>(invSqrt);
+            }
+        }
+        else
+        {
+            for (int i = 0; i < rows; ++i)
+            {
+                sqrtDiagHost[i] = DeviceScalar(1);
+                invSqrtDiagHost[i] = DeviceScalar(1);
+            }
+        }
+
+        if (!precondDiag.empty())
+        {
+            std::vector<double> diagTmp(precondDiag.size());
+            for (label i = 0; i < precondDiag.size(); ++i)
+            {
+                diagTmp[i] = static_cast<double>(precondDiag[i]);
+            }
+            const std::size_t midIdx = diagTmp.size()/2;
+            std::nth_element(diagTmp.begin(), diagTmp.begin() + midIdx, diagTmp.end());
+            double medianScaled = diagTmp[midIdx];
+            if (diagTmp.size() % 2 == 0 && midIdx > 0)
+            {
+                std::nth_element(diagTmp.begin(), diagTmp.begin() + midIdx - 1, diagTmp.end());
+                medianScaled = 0.5*(medianScaled + diagTmp[midIdx - 1]);
+            }
+            icDiagMedianScaled = std::max(icDiagMedianScaled, std::abs(medianScaled));
+        }
+
+        std::size_t scaleId = hashCombine(0, hashDouble(static_cast<double>(diagFloorCfg)));
+        scaleId = hashCombine(scaleId, hashDouble(invSqrtClampUsed));
+        scaleId = hashCombine(scaleId, static_cast<std::size_t>(numFlooredDiag));
+        scaleId = hashCombine(scaleId, static_cast<std::size_t>(invSqrtClampLocal));
+        scaleId = hashCombine(scaleId, static_cast<std::size_t>(icUseDiagonalScaling ? 1 : 0));
+        scaleId = hashCombine(scaleId, static_cast<std::size_t>(icUseRuizScaling ? 1 : 0));
+        scaleId = hashCombine(scaleId, matvecSignD < 0.0 ? std::size_t(1) : std::size_t(0));
+
+        PreconCacheKey cacheKey;
+        cacheKey.matrixPatternId = matrixPatternId;
+        cacheKey.scaleId = scaleId;
+        cacheKey.permutationId = permutationId;
+        cacheKey.deviceId = deviceId;
+        if (useAmg)
+        {
+            cacheKey.kind = PreconCacheKind::AMG;
+        }
+        else if (useIC)
+        {
+            cacheKey.kind = PreconCacheKind::IC0;
+        }
+        else if (useILU)
+        {
+            cacheKey.kind = PreconCacheKind::ILU0;
+        }
+        else if (useColour)
+        {
+            cacheKey.kind = PreconCacheKind::Colour;
+        }
+        else if (useSGS)
+        {
+            cacheKey.kind = PreconCacheKind::SGS;
+        }
+        else if (useChebyshev)
+        {
+            cacheKey.kind = PreconCacheKind::Chebyshev;
+        }
+        else
+        {
+            cacheKey.kind = PreconCacheKind::Diagonal;
+        }
+
+        preconCacheEntry = &getPreconCacheEntry(cacheKey);
+        if (std::fabs(preconCacheEntry->cachedMatvecSign - matvecSignD) > 0.5)
+        {
+            preconCacheEntry->resetIcReuseState();
+        }
+        preconCacheEntry->cachedMatvecSign = matvecSignD;
+        if (!preconCacheEntry->ensureCapacity(rows))
+        {
+            return fail("preconCacheAlloc");
+        }
+        preconCacheEntry->icUsedDiagonalScaling = icUseDiagonalScaling;
+        preconCacheEntry->icUsedRuizScaling = icUseRuizScaling;
+
+        preconCacheEntry->ruizReady = false;
+        preconCacheEntry->ruizClampRatio = 0.0;
+        preconCacheEntry->ruizScaleMin = 1.0;
+        preconCacheEntry->ruizScaleMax = 1.0;
+        if (icUseRuizScaling)
+        {
+            Foam::List<double> ruizValues(nnz);
+            for (int idx = 0; idx < nnz; ++idx)
+            {
+                ruizValues[idx] = static_cast<double>(values[idx]);
+            }
+            std::vector<double> ruizScale;
+            computeRuizScale(rowPtr, colInd, ruizValues, ruizScale);
+            if (!ruizScale.empty() && preconCacheEntry->d_ruizScale && preconCacheEntry->d_ruizInvScale)
+            {
+                const double ruizClampFloor = 1e-6;
+                const double ruizClampCeil = 1e6;
+                Foam::label clampCount = 0;
+                List<DeviceScalar> ruizScaleHost(rows);
+                List<DeviceScalar> ruizInvScaleHost(rows);
+                for (int i = 0; i < rows; ++i)
+                {
+                    double s = ruizScale[i];
+                    if (s < ruizClampFloor)
+                    {
+                        s = ruizClampFloor;
+                        ++clampCount;
+                    }
+                    else if (s > ruizClampCeil)
+                    {
+                        s = ruizClampCeil;
+                        ++clampCount;
+                    }
+                    preconCacheEntry->ruizScaleMin = std::min(preconCacheEntry->ruizScaleMin, s);
+                    preconCacheEntry->ruizScaleMax = std::max(preconCacheEntry->ruizScaleMax, s);
+                    ruizScaleHost[i] = static_cast<DeviceScalar>(s);
+                    const double invS = s > ruizClampFloor ? 1.0/s : 1.0;
+                    ruizInvScaleHost[i] = static_cast<DeviceScalar>(invS);
+                    const double invDiag = static_cast<double>(invSqrtDiagHost[i]);
+                    invSqrtDiagHost[i] = static_cast<DeviceScalar>(invDiag * s);
+                }
+        preconCacheEntry->ruizClampRatio = rows > 0 ? static_cast<double>(clampCount)/static_cast<double>(rows) : 0.0;
+        if
+        (
+            cudaMemcpy
+            (
+                        preconCacheEntry->d_ruizScale,
+                        ruizScaleHost.begin(),
+                        sizeof(DeviceScalar)*rows,
+                        cudaMemcpyHostToDevice
+                    ) != cudaSuccess
+                 || cudaMemcpy
+                    (
+                        preconCacheEntry->d_ruizInvScale,
+                        ruizInvScaleHost.begin(),
+                        sizeof(DeviceScalar)*rows,
+                        cudaMemcpyHostToDevice
+                    ) != cudaSuccess
+                )
+                {
+                    return fail("ruizScaleCopy");
+                }
+                preconCacheEntry->ruizReady = true;
+            }
+        }
+
+        if
+        (
+            cudaMemcpy
+            (
+                preconCacheEntry->d_sqrtDiag,
+                sqrtDiagHost.begin(),
+                sizeof(DeviceScalar)*rows,
+                cudaMemcpyHostToDevice
+            ) != cudaSuccess
+         || cudaMemcpy
+            (
+                preconCacheEntry->d_invSqrtDiag,
+                invSqrtDiagHost.begin(),
+                sizeof(DeviceScalar)*rows,
+                cudaMemcpyHostToDevice
+            ) != cudaSuccess
+        )
+        {
+            return fail("preconCacheCopy");
+        }
+
+        preconCacheEntry->flooredCount = numFlooredDiag;
+        preconCacheEntry->diagFloorApplied = diagFloorCfg;
+        preconCacheEntry->invSqrtClampCount = invSqrtClampLocal;
+        preconCacheEntry->invSqrtClampLimit = invSqrtClampEffective;
+        preconCacheEntry->lambdaReady = false;
+        preconCacheEntry->lambdaMin = 0.0;
+        preconCacheEntry->lambdaMax = 0.0;
+        invSqrtClamped = invSqrtClampLocal;
+        invSqrtClampUsed = invSqrtClampEffective;
+        if (!sqrtDiagHost.empty())
+        {
+            scaledRowSumMax = 0.0;
+            for (int row = 0; row < rows; ++row)
+            {
+                const double si = (row < sqrtDiagHost.size() && sqrtDiagHost[row] > VSMALL)
+                    ? static_cast<double>(sqrtDiagHost[row])
+                    : 1.0;
+                double rowSum = 0.0;
+                for (int k = rowPtr[row]; k < rowPtr[row+1]; ++k)
+                {
+                    const int col = colInd[k];
+                    const double sj = (col < sqrtDiagHost.size() && sqrtDiagHost[col] > VSMALL)
+                        ? static_cast<double>(sqrtDiagHost[col])
+                        : 1.0;
+                    const double scaledVal = std::abs(static_cast<double>(values[k])/(si*sj));
+                    rowSum += scaledVal;
+                }
+                scaledRowSumMax = std::max(scaledRowSumMax, rowSum);
+            }
+            scaledRowSumReady = true;
+        }
+
+        if (diagSnapshotEnable && Pstream::master())
+        {
+            const Time& runTime = matrix_.mesh().thisDb().time();
+            auto resolveSnapshotPath = [&](const fileName& fName) -> fileName
+            {
+                if (fName == fileName::null)
+                {
+                    return fName;
+                }
+                if (fName.isAbsolute())
+                {
+                    return fName;
+                }
+                return runTime.globalPath()/fName;
+            };
+
+            auto quantileFromSorted = [](const auto& sortedVec, double fraction) -> double
+            {
+                if (sortedVec.empty())
+                {
+                    return 0.0;
+                }
+                fraction = std::max(0.0, std::min(1.0, fraction));
+                const double position = fraction * static_cast<double>(sortedVec.size() - 1);
+                const std::size_t lowerIdx = static_cast<std::size_t>(std::floor(position));
+                const std::size_t upperIdx = static_cast<std::size_t>(std::ceil(position));
+                const double weight = position - static_cast<double>(lowerIdx);
+                const double lowerVal = static_cast<double>(sortedVec[lowerIdx]);
+                const double upperVal = static_cast<double>(sortedVec[upperIdx]);
+                return (1.0 - weight)*lowerVal + weight*upperVal;
+            };
+
+            const double q001 = quantileFromSorted(absDiagVals, 0.001);
+            const double q005 = quantileFromSorted(absDiagVals, 0.005);
+            const double q01 = quantileFromSorted(absDiagVals, 0.01);
+            const double q02 = quantileFromSorted(absDiagVals, 0.02);
+            const double q05 = quantileFromSorted(absDiagVals, 0.05);
+            const double q50 = static_cast<double>(medianAbsDiag);
+
+            std::vector<double> invSqrtVals(rows, 0.0);
+            for (int i = 0; i < rows; ++i)
+            {
+                const double reg = std::max(static_cast<double>(precondDiag[i]), 0.0);
+                const double sqrtVal = reg > 0 ? std::sqrt(reg) : 1.0;
+                invSqrtVals[i] = (sqrtVal > VSMALL) ? 1.0/sqrtVal : 0.0;
+            }
+            std::vector<double> invSqrtSorted(invSqrtVals);
+            std::sort(invSqrtSorted.begin(), invSqrtSorted.end());
+            const double clampTarget = std::max(0.0, std::min(1.0, static_cast<double>(diagSnapshotClampRatioCfg)));
+            const double clampQuantile = clampTarget < 1.0 ? 1.0 - clampTarget : 0.99;
+            double clampCandidate = invSqrtSorted.empty()
+                ? 0.0
+                : quantileFromSorted(invSqrtSorted, clampQuantile);
+            if (invSqrtClampMaxCfg > scalar(0))
+            {
+                clampCandidate = std::min(clampCandidate, static_cast<double>(invSqrtClampMaxCfg));
+            }
+            label clampCountCandidate = 0;
+            for (double val : invSqrtVals)
+            {
+                if (val > clampCandidate)
+                {
+                    ++clampCountCandidate;
+                }
+            }
+
+            std::vector<double> alphaList = {0.5, 0.7, 1.0};
+            const double alphaCfg = static_cast<double>(diagQuantileAlphaCfg);
+            if (alphaCfg > 0.0 && std::find(alphaList.begin(), alphaList.end(), alphaCfg) == alphaList.end())
+            {
+                alphaList.push_back(alphaCfg);
+            }
+            std::sort(alphaList.begin(), alphaList.end());
+
+            std::vector<std::tuple<double, double, double>> floorSummary;
+            for (double alpha : alphaList)
+            {
+                const double candidate =
+                    std::max
+                    (
+                        {
+                            static_cast<double>(diagFloorAbsCfg),
+                            static_cast<double>(diagFloorRelCfg)*static_cast<double>(medianAbsDiag),
+                            alpha*q01
+                        }
+                    );
+                label flooredCountCandidate = 0;
+                forAll(diag, cellI)
+                {
+                    if (mag(diag[cellI]) < candidate)
+                    {
+                        ++flooredCountCandidate;
+                    }
+                }
+                const double flooredPctCandidate =
+                    rows > 0 ? static_cast<double>(flooredCountCandidate)/static_cast<double>(rows) : 0.0;
+                floorSummary.emplace_back(alpha, candidate, flooredPctCandidate);
+            }
+
+            fileName snapshotPath = diagSnapshotFileCfg;
+            if (snapshotPath == fileName::null)
+            {
+                snapshotPath = fileName("postProcessing/cudaPCG/" + fieldName_ + "_diagSnapshot.csv");
+            }
+            snapshotPath = resolveSnapshotPath(snapshotPath);
+            const fileName snapshotParent = snapshotPath.path();
+            if (!snapshotParent.empty())
+            {
+                mkDir(snapshotParent);
+            }
+            OFstream snapshot(snapshotPath);
+            snapshot.setf(std::ios::scientific);
+            snapshot.precision(IOstream::defaultPrecision());
+            snapshot<< "# cudaPCG diagonal snapshot for " << fieldName_ << nl;
+            snapshot<< "# time," << runTime.value() << nl;
+            snapshot<< "# rows," << rows << nl;
+            snapshot<< "# diagFloorAbsCfg," << diagFloorAbsCfg << nl;
+            snapshot<< "# diagFloorRelCfg," << diagFloorRelCfg << nl;
+            snapshot<< "# diagQuantileFracCfg," << diagQuantileFracCfg << nl;
+            snapshot<< "# diagQuantileAlphaCfg," << diagQuantileAlphaCfg << nl;
+            snapshot<< "# invSqrtClampCfg," << invSqrtClampCfg << nl;
+            snapshot<< "# invSqrtClampSafetyCfg," << invSqrtClampSafetyCfg << nl;
+            snapshot<< "# invSqrtClampMaxCfg," << invSqrtClampMaxCfg << nl;
+            snapshot<< "# medianAbs," << q50 << nl;
+            snapshot<< "# quantile0.1pct," << q001 << nl;
+            snapshot<< "# quantile0.5pct," << q005 << nl;
+            snapshot<< "# quantile1pct," << q01 << nl;
+            snapshot<< "# quantile2pct," << q02 << nl;
+            snapshot<< "# quantile5pct," << q05 << nl;
+            snapshot<< "# flooredCountCurrent," << numFlooredDiag << nl;
+            const double flooredPctCurrent =
+                rows > 0 ? static_cast<double>(numFlooredDiag)/static_cast<double>(rows) : 0.0;
+            snapshot<< "# flooredPctCurrent," << flooredPctCurrent << nl;
+            snapshot<< "# clampCountCurrent," << invSqrtClamped << nl;
+            const double clampPctCurrent =
+                rows > 0 ? static_cast<double>(invSqrtClamped)/static_cast<double>(rows) : 0.0;
+            snapshot<< "# clampPctCurrent," << clampPctCurrent << nl;
+            snapshot<< "# clampCandidate," << clampCandidate << nl;
+            const double clampPctCandidate =
+                rows > 0 ? static_cast<double>(clampCountCandidate)/static_cast<double>(rows) : 0.0;
+            snapshot<< "# clampPctCandidate," << clampPctCandidate << nl;
+            snapshot<< "# clampTarget," << clampTarget << nl;
+            for (const auto& entry : floorSummary)
+            {
+                const double alpha = std::get<0>(entry);
+                const double candidate = std::get<1>(entry);
+                const double flooredPct = std::get<2>(entry);
+                snapshot<< "# floorCandidate_alpha=" << alpha << ',' << candidate
+                         << ",flooredPct," << flooredPct << nl;
+            }
+            snapshot<< "index,diag,absDiag,invSqrt" << nl;
+            for (int i = 0; i < rows; ++i)
+            {
+                const double diagValue = static_cast<double>(diag[i]);
+                snapshot<< i << ','
+                         << diagValue << ','
+                         << std::abs(diagValue) << ','
+                         << invSqrtVals[i] << nl;
+            }
+            Info<< "cudaPCG(" << fieldName_ << "): diag snapshot -> " << snapshotPath << nl;
+        }
+    }
+
+    invSqrtClampRatio =
+        rows > 0 ? static_cast<scalar>(invSqrtClamped)/static_cast<scalar>(rows) : scalar(0);
+    scalar clampRatioForGate = invSqrtClampRatio;
+    if (preconCacheEntry && preconCacheEntry->ruizReady)
+    {
+        clampRatioForGate = max
+        (
+            clampRatioForGate,
+            static_cast<scalar>(preconCacheEntry->ruizClampRatio)
+        );
+    }
+    if
+    (
+        useChebyshev
+     && chebyshevClampRatioLimit >= scalar(0)
+     && clampRatioForGate > chebyshevClampRatioLimit
+    )
+    {
+        chebyshevClampGuardTriggered = true;
+        chebyshevGuardrailTriggered = true;
+        chebyshevClampGate = true;
+        useChebyshev = false;
+        colourSpdMode = true;
+        useColour = true;
+        chebyshevPrevResidual = -1;
+        chebyshevGrowthCounter = 0;
+    }
+
+    if (reportStats)
+    {
+        Info<< "cudaPCG: diagonal range [" << minDiag << ", " << maxDiag << "]"
+            << " (regularised [" << minDiagReg << ", " << maxDiagReg << "])"
+            << " medianAbs=" << medianAbsDiag
+            << " quantileFrac=" << diagQuantileFracCfg
+            << " quantileAbs=" << diagQuantileValue
+            << " floorUsed=" << diagFloorCfg
+            << " flooredCount=" << numFlooredDiag
+            << " invSqrtClampLimit=" << invSqrtClampUsed
+            << " invSqrtClampCount=" << invSqrtClamped
+            << " clampRatio=" << invSqrtClampRatio;
+        if (preconCacheEntry && preconCacheEntry->ruizReady)
+        {
+            Info<< " ruizClampRatio=" << preconCacheEntry->ruizClampRatio
+                << " ruizScale[min,max]=[" << preconCacheEntry->ruizScaleMin
+                << ',' << preconCacheEntry->ruizScaleMax << ']';
+        }
+        Info<< nl;
+    }
+
+    List<DeviceScalar> matrixValsHost(nnz);
+    List<DeviceScalar> spmvValsHost(nnz);
+    List<DeviceScalar> factorValsHost(nnz);
+    const bool scaleIcFactors =
+        (icUseDiagonalScaling || icUseRuizScaling)
+     && (invSqrtDiagHost.size() == rows);
+    std::vector<double> factorDiag(rows, 0.0);
+    auto populateOperatorArrays =
+        [&]()
+    {
+        for (int row = 0; row < rows; ++row)
+        {
+            const double sRow = scaleIcFactors ? static_cast<double>(invSqrtDiagHost[row]) : 1.0;
+            for (int k = rowPtr[row]; k < rowPtr[row+1]; ++k)
+            {
+                const int col = colInd[k];
+                const double sCol = scaleIcFactors ? static_cast<double>(invSqrtDiagHost[col]) : 1.0;
+                const double baseValPhysical = static_cast<double>(values[k]);
+                matrixValsHost[k] = static_cast<DeviceScalar>(baseValPhysical);
+                double factVal = matvecSignD * baseValPhysical;
+                if (scaleIcFactors)
+                {
+                    factVal *= sRow * sCol;
+                }
+                factorValsHost[k] = static_cast<DeviceScalar>(factVal);
+                spmvValsHost[k] = static_cast<DeviceScalar>(matvecSignD * baseValPhysical);
+                if (col == row)
+                {
+                    factorDiag[row] = factVal;
+                }
+            }
+        }
+    };
+    populateOperatorArrays();
+    double factorScale = 1.0;
+    double factorMedianDiag = 0.0;
+    double factorScaleApplied = 1.0;
+    auto computeMedian = [](std::vector<double>& data) -> double
+    {
+        if (data.empty())
+        {
+            return 0.0;
+        }
+        const std::size_t mid = data.size()/2;
+        std::nth_element(data.begin(), data.begin() + mid, data.end());
+        double median = data[mid];
+        if (data.size() % 2 == 0 && mid > 0)
+        {
+            std::nth_element(data.begin(), data.begin() + mid - 1, data.end());
+            median = 0.5*(median + data[mid - 1]);
+        }
+        return median;
+    };
+    if (scaleIcFactors || permutationActive || icNormalizeFactor)
+    {
+        std::vector<double> positiveDiag;
+        positiveDiag.reserve(rows);
+        double factorTightMedian = 0.0;
+        for (double d : factorDiag)
+        {
+            const double absVal = std::fabs(d);
+            if (absVal > 0.0)
+            {
+                positiveDiag.push_back(absVal);
+            }
+        }
+        double factorScaleRaw = factorScale;
+        if (!positiveDiag.empty())
+        {
+            factorMedianDiag = computeMedian(positiveDiag);
+            const double medianSafe = std::max(factorMedianDiag, 1e-18);
+            const double scaleRoot = 1.0/std::sqrt(medianSafe);
+            factorScale = scaleRoot;
+            factorScaleRaw = factorScale;
+        }
+        if (!std::isfinite(factorScale) || factorScale <= 0.0)
+        {
+            factorScale = 1.0;
+        }
+        const double normClampMin =
+            icNormalizeClampMinCfg > scalar(0)
+              ? std::max(1e-12, static_cast<double>(icNormalizeClampMinCfg))
+              : 0.0;
+        const double normClampMax =
+            icNormalizeClampMaxCfg > scalar(0)
+              ? static_cast<double>(icNormalizeClampMaxCfg)
+              : std::numeric_limits<double>::infinity();
+        if (normClampMax > 0.0 && factorScale > normClampMax)
+        {
+            factorScale = normClampMax;
+        }
+        if (normClampMin > 0.0 && factorScale < normClampMin)
+        {
+            factorScale = normClampMin;
+        }
+        factorScaleApplied = factorScale;
+        const bool scaleApplied = std::fabs(factorScale - 1.0) > 1e-12;
+        if (scaleApplied)
+        {
+            for (int k = 0; k < nnz; ++k)
+            {
+                const double scaled = static_cast<double>(factorValsHost[k]) * factorScale;
+                factorValsHost[k] = static_cast<DeviceScalar>(scaled);
+            }
+            for (double& d : factorDiag)
+            {
+                d *= factorScale;
+            }
+        }
+        else if (positiveDiag.empty() && reportStats && (!Pstream::parRun() || Pstream::master()))
+        {
+            Info<< "cudaPCG(" << fieldName_ << "): factor diag contains no positive entries; "
+                << "skipping scaling" << nl;
+        }
+        if (reportStats && (!Pstream::parRun() || Pstream::master()))
+        {
+            Info<< "cudaPCG(" << fieldName_ << "): IC normalization median=" << factorMedianDiag
+                << " alphaRaw=" << factorScaleRaw
+                << " alphaApplied=" << factorScaleApplied
+                << " clamp=[";
+            if (normClampMin > 0.0)
+            {
+                Info<< normClampMin;
+            }
+            else
+            {
+                Info<< "off";
+            }
+            Info<< ',';
+            if (std::isfinite(normClampMax))
+            {
+                Info<< normClampMax;
+            }
+            else
+            {
+                Info<< "off";
+            }
+            Info<< ']' << nl;
+        }
+    }
+    if (icDebugDump && reportStats && (!Pstream::parRun() || Pstream::master()))
+    {
+        double diagMin = std::numeric_limits<double>::max();
+        double diagMax = -std::numeric_limits<double>::max();
+        for (double d : factorDiag)
+        {
+            if (d == 0.0)
+            {
+                continue;
+            }
+            diagMin = std::min(diagMin, d);
+            diagMax = std::max(diagMax, d);
+        }
+        if (diagMin <= diagMax)
+        {
+            Info<< "cudaPCG(" << fieldName_ << "): IC factor diag median=" << factorMedianDiag
+                << " scale=" << factorScaleApplied
+                << " diag[min,max]=[" << diagMin << ',' << diagMax << ']' << nl;
+        }
+    }
+
+    List<int> factorRowPtrPerm;
+    List<int> factorColIndPerm;
+    List<DeviceScalar> factorValsPerm;
+    if (permutationActive)
+    {
+        factorRowPtrPerm.setSize(rows + 1);
+        factorColIndPerm.setSize(nnz);
+        factorValsPerm.setSize(nnz);
+        std::vector<double> factorDiagPerm(rows, 0.0);
+        label cursor = 0;
+        factorRowPtrPerm[0] = 0;
+        std::vector<std::pair<int, double>> rowEntries;
+        for (Foam::label newRow = 0; newRow < rows; ++newRow)
+        {
+            const Foam::label origRow = permutation[newRow];
+            rowEntries.clear();
+            const int start = rowPtr[origRow];
+            const int end = rowPtr[origRow + 1];
+            rowEntries.reserve(end - start);
+            for (int kk = start; kk < end; ++kk)
+            {
+                const int origCol = colInd[kk];
+                const int newCol = permutationInverse[origCol];
+                rowEntries.emplace_back(newCol, static_cast<double>(factorValsHost[kk]));
+            }
+            std::sort
+            (
+                rowEntries.begin(),
+                rowEntries.end(),
+                [](const std::pair<int, double>& a, const std::pair<int, double>& b)
+                {
+                    return a.first < b.first;
+                }
+            );
+            for (const auto& entry : rowEntries)
+            {
+                factorColIndPerm[cursor] = entry.first;
+                factorValsPerm[cursor] = static_cast<DeviceScalar>(entry.second);
+                if (entry.first == newRow)
+                {
+                    factorDiagPerm[newRow] = entry.second;
+                }
+                ++cursor;
+            }
+            factorRowPtrPerm[newRow + 1] = cursor;
+        }
+        factorDiag = factorDiagPerm;
+
+        bool permStructureOk = true;
+        double permMaxDiff = 0.0;
+        if (preconCacheEntry)
+        {
+            std::unordered_set<Foam::label> sampledRows;
+            std::mt19937 rng(static_cast<unsigned>
+                (
+                    permutationId
+                  ? permutationId
+                  : hashCombine(matrixPatternId, static_cast<std::size_t>(rows))
+                ));
+            const int samples = std::min(rows, 5);
+            std::uniform_int_distribution<Foam::label> rowDist(0, rows - 1);
+            for (int sample = 0; sample < samples && permStructureOk; ++sample)
+            {
+                Foam::label newRow = sample;
+                if (rows > samples)
+                {
+                    do
+                    {
+                        newRow = rowDist(rng);
+                    }
+                    while (!sampledRows.insert(newRow).second);
+                }
+                else
+                {
+                    sampledRows.insert(newRow);
+                }
+
+                const Foam::label origRow = permutation[newRow];
+                const int origStart = rowPtr[origRow];
+                const int origEnd = rowPtr[origRow + 1];
+                const int permStart = factorRowPtrPerm[newRow];
+                const int permEnd = factorRowPtrPerm[newRow + 1];
+                if ((origEnd - origStart) != (permEnd - permStart))
+                {
+                    permStructureOk = false;
+                    break;
+                }
+                for (int kk = origStart; kk < origEnd; ++kk)
+                {
+                    const int expectedCol = permutationInverse[colInd[kk]];
+                    const double expectedVal = static_cast<double>(factorValsHost[kk]);
+                    bool found = false;
+                    for (int jj = permStart; jj < permEnd; ++jj)
+                    {
+                        if (factorColIndPerm[jj] == expectedCol)
+                        {
+                            const double actualVal = static_cast<double>(factorValsPerm[jj]);
+                            const double diff = std::fabs(actualVal - expectedVal);
+                            permMaxDiff = std::max(permMaxDiff, diff);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found)
+                    {
+                        permStructureOk = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!permStructureOk)
+        {
+            return fail("icPermutationAssemble");
+        }
+        if (preconCacheEntry)
+        {
+            preconCacheEntry->permutationStructureValidated = true;
+        }
+        if
+        (
+            preconCacheEntry
+         && reportStats
+         && (!Pstream::parRun() || Pstream::master())
+        )
+        {
+            Info<< "cudaPCG(" << fieldName_ << "): permutation CSR verification max|Δ|="
+                << permMaxDiff << nl;
+        }
+    }
+
+    const List<int>* factorRowPtrPtr =
+        permutationActive ? &factorRowPtrPerm : &rowPtr;
+    const List<int>* factorColIndPtr =
+        permutationActive ? &factorColIndPerm : &colInd;
+    const List<DeviceScalar>* factorValsNumericPtr =
+        permutationActive ? &factorValsPerm : &factorValsHost;
+
+    const List<int>& factorRowPtrHost = *factorRowPtrPtr;
+    const List<int>& factorColIndHost = *factorColIndPtr;
+    const List<DeviceScalar>& factorValsNumeric = *factorValsNumericPtr;
+
+    if (permutationActive)
+    {
+        if (!preconCacheEntry->setPermutationData(permutation))
+        {
+            return fail("icPermutationAlloc");
+        }
+
+        Foam::labelList rowPtrLabels(factorRowPtrHost.size());
+        forAll(rowPtrLabels, i)
+        {
+            rowPtrLabels[i] = factorRowPtrHost[i];
+        }
+        Foam::labelList colIndLabels(factorColIndHost.size());
+        forAll(colIndLabels, i)
+        {
+            colIndLabels[i] = factorColIndHost[i];
+        }
+        if (!preconCacheEntry->setIcPatternData(rowPtrLabels, colIndLabels))
+        {
+            return fail("icPermutationPattern");
+        }
+        preconCacheEntry->permutationStructureValidated = true;
+    }
+    else
+    {
+        preconCacheEntry->permutationReady = false;
+        preconCacheEntry->icPatternReady = false;
+        preconCacheEntry->permutationValidated = false;
+        preconCacheEntry->permutationStructureValidated = false;
+    }
+
+    auto scaledSpMV =
+        [&](double* yScaled, const double* xScaled) -> bool
+    {
+        if (!preconCacheEntry || !preconCacheEntry->d_invSqrtDiag)
+        {
+            message = word("scaledSpMVNoCache");
+            return false;
+        }
+        double* tmpVec = preconCacheEntry->d_scaledTmp;
+        if (!tmpVec)
+        {
+            message = word("scaledSpMVNoTmp");
+            return false;
+        }
+        if (cublasDcopy(cublasHandle, rows, xScaled, 1, tmpVec, 1) != CUBLAS_STATUS_SUCCESS)
+        {
+            message = word("scaledSpMVCopy");
+            return false;
+        }
+        if
+        (
+            cublasDdgmm
+            (
+                cublasHandle,
+                CUBLAS_SIDE_LEFT,
+                rows,
+                1,
+                tmpVec,
+                rows,
+                preconCacheEntry->d_invSqrtDiag,
+                1,
+                tmpVec,
+                rows
+            ) != CUBLAS_STATUS_SUCCESS
+        )
+        {
+            message = word("scaledSpMVScaleIn");
+            return false;
+        }
+
+        cusparseDnVecDescr_t localVecX = nullptr;
+        cusparseDnVecDescr_t localVecY = nullptr;
+        if (cusparseCreateDnVec(&localVecX, rows, tmpVec, CUDA_R_64F) != CUSPARSE_STATUS_SUCCESS)
+        {
+            message = word("scaledSpMVCreateX");
+            return false;
+        }
+        if (cusparseCreateDnVec(&localVecY, rows, yScaled, CUDA_R_64F) != CUSPARSE_STATUS_SUCCESS)
+        {
+            cusparseDestroyDnVec(localVecX);
+            message = word("scaledSpMVCreateY");
+            return false;
+        }
+
+        const double oneD = 1.0;
+        const double zeroD = 0.0;
+        cusparseStatus_t spmvStatus =
+            cusparseSpMV
+            (
+                cusparseHandle,
+                CUSPARSE_OPERATION_NON_TRANSPOSE,
+                &oneD,
+                matA,
+                localVecX,
+                &zeroD,
+                localVecY,
+                CUDA_R_64F,
+                CUSPARSE_SPMV_ALG_DEFAULT,
+                spmvBuffer
+            );
+        cusparseDestroyDnVec(localVecX);
+        cusparseDestroyDnVec(localVecY);
+        if (spmvStatus != CUSPARSE_STATUS_SUCCESS)
+        {
+            message = word("scaledSpMVSpmv");
+            return false;
+        }
+        if
+        (
+            cublasDdgmm
+            (
+                cublasHandle,
+                CUBLAS_SIDE_LEFT,
+                rows,
+                1,
+                yScaled,
+                rows,
+                preconCacheEntry->d_invSqrtDiag,
+                1,
+                yScaled,
+                rows
+            ) != CUBLAS_STATUS_SUCCESS
+        )
+        {
+            message = word("scaledSpMVScaleOut");
+            return false;
+        }
+        return true;
+    };
+
+    auto ensureChebyshevSpectrum = [&]() -> bool
+    {
+        if (!useChebyshev)
+        {
+            return true;
+        }
+        if
+        (
+            !preconCacheEntry
+         || !preconCacheEntry->d_scaledResidual
+         || !preconCacheEntry->d_scaledAp
+         || !preconCacheEntry->d_invSqrtDiag
+         || !preconCacheEntry->d_scaledTmp
+        )
+        {
+            message = word("ChebCacheIncomplete");
+            return false;
+        }
+        if (preconCacheEntry->lambdaReady && preconCacheEntry->lambdaMax > VSMALL)
+        {
+            chebyshevLambdaMinUsed = static_cast<scalar>(preconCacheEntry->lambdaMin);
+            chebyshevLambdaMaxUsed = static_cast<scalar>(preconCacheEntry->lambdaMax);
+            return true;
+        }
+
+        List<DeviceScalar> onesHost(rows, DeviceScalar(1));
+        if
+        (
+            cudaMemcpy
+            (
+                preconCacheEntry->d_scaledResidual,
+                onesHost.begin(),
+                sizeof(DeviceScalar)*rows,
+                cudaMemcpyHostToDevice
+            ) != cudaSuccess
+        )
+        {
+            message = word("ChebSpectrumInit");
+            return false;
+        }
+
+        double lambdaEstimate = 0.0;
+        bool powerOk = true;
+        const int maxPowerIter = 12;
+        for (int iter = 0; iter < maxPowerIter && powerOk; ++iter)
+        {
+            if (!scaledSpMV(preconCacheEntry->d_scaledAp, preconCacheEntry->d_scaledResidual))
+            {
+                powerOk = false;
+                break;
+            }
+
+            double vTw = 0.0;
+            double vTv = 0.0;
+            if
+            (
+                cublasDdot
+                (
+                    cublasHandle,
+                    rows,
+                    preconCacheEntry->d_scaledResidual,
+                    1,
+                    preconCacheEntry->d_scaledAp,
+                    1,
+                    &vTw
+                ) != CUBLAS_STATUS_SUCCESS
+            )
+            {
+                powerOk = false;
+                break;
+            }
+            if
+            (
+                cublasDdot
+                (
+                    cublasHandle,
+                    rows,
+                    preconCacheEntry->d_scaledResidual,
+                    1,
+                    preconCacheEntry->d_scaledResidual,
+                    1,
+                    &vTv
+                ) != CUBLAS_STATUS_SUCCESS
+            )
+            {
+                powerOk = false;
+                break;
+            }
+            if (vTv > VSMALL)
+            {
+                lambdaEstimate = vTw / vTv;
+            }
+
+            double normW = 0.0;
+            if
+            (
+                cublasDnrm2
+                (
+                    cublasHandle,
+                    rows,
+                    preconCacheEntry->d_scaledAp,
+                    1,
+                    &normW
+                ) != CUBLAS_STATUS_SUCCESS
+            )
+            {
+                powerOk = false;
+                break;
+            }
+            if (normW > VSMALL)
+            {
+                const double invNorm = 1.0/normW;
+                if
+                (
+                    cublasDcopy
+                    (
+                        cublasHandle,
+                        rows,
+                        preconCacheEntry->d_scaledAp,
+                        1,
+                        preconCacheEntry->d_scaledResidual,
+                        1
+                    ) != CUBLAS_STATUS_SUCCESS
+                )
+                {
+                    powerOk = false;
+                    break;
+                }
+                if
+                (
+                    cublasDscal
+                    (
+                        cublasHandle,
+                        rows,
+                        &invNorm,
+                        preconCacheEntry->d_scaledResidual,
+                        1
+                    ) != CUBLAS_STATUS_SUCCESS
+                )
+                {
+                    powerOk = false;
+                    break;
+                }
+            }
+        }
+
+        double lambdaMaxCandidate = lambdaEstimate * 1.2;
+        if (!powerOk || !std::isfinite(lambdaEstimate) || lambdaEstimate <= VSMALL)
+        {
+            if (scaledRowSumReady && std::isfinite(scaledRowSumMax) && scaledRowSumMax > VSMALL)
+            {
+                lambdaMaxCandidate = 1.5 * scaledRowSumMax;
+            }
+            else
+            {
+                lambdaMaxCandidate = 1.0;
+            }
+        }
+        if (!std::isfinite(lambdaMaxCandidate) || lambdaMaxCandidate <= VSMALL)
+        {
+            lambdaMaxCandidate = 1.0;
+        }
+
+        preconCacheEntry->lambdaMax = lambdaMaxCandidate;
+        preconCacheEntry->lambdaMin = std::max
+        (
+            std::max(0.05*lambdaMaxCandidate, static_cast<double>(chebyshevLambdaMinFloor)),
+            static_cast<double>(chebyshevLambdaMinFloor)
+        );
+        if (preconCacheEntry->lambdaMin >= preconCacheEntry->lambdaMax)
+        {
+            preconCacheEntry->lambdaMin = std::max
+            (
+                static_cast<double>(chebyshevLambdaMinFloor),
+                0.5*preconCacheEntry->lambdaMax
+            );
+        }
+        preconCacheEntry->lambdaReady = true;
+
+        chebyshevLambdaMinUsed = static_cast<scalar>(preconCacheEntry->lambdaMin);
+        chebyshevLambdaMaxUsed = static_cast<scalar>(preconCacheEntry->lambdaMax);
+
+        if (reportStats)
+        {
+            Info<< "cudaPCG(" << fieldName_ << "): Chebyshev spectral window ["
+                << preconCacheEntry->lambdaMin << ", " << preconCacheEntry->lambdaMax << ']' << nl;
+        }
+        return true;
+    };
+
+    auto applyChebyshevSpd =
+        [&](const double* rhs, double* out) -> bool
+    {
+        if
+        (
+            !preconCacheEntry
+         || !preconCacheEntry->d_scaledResidual
+         || !preconCacheEntry->d_scaledDirection
+         || !preconCacheEntry->d_scaledAp
+         || !preconCacheEntry->d_invSqrtDiag
+        )
+        {
+            message = word("ChebCacheMissing");
+            return false;
+        }
+        if (!ensureChebyshevSpectrum())
+        {
+            return false;
+        }
+
+        const double lambdaMax = preconCacheEntry->lambdaMax;
+        const double lambdaMin = preconCacheEntry->lambdaMin;
+        const double theta = 0.5*(lambdaMax + lambdaMin);
+        const double delta = 0.5*(lambdaMax - lambdaMin);
+
+        double alpha = 1.0/theta;
+        double alphaPrev = alpha;
+        double beta = 0.0;
+        const double oneD = 1.0;
+
+        double* rScaled = preconCacheEntry->d_scaledResidual;
+        double* pScaled = preconCacheEntry->d_scaledDirection;
+        double* ApScaled = preconCacheEntry->d_scaledAp;
+
+        if (cublasDcopy(cublasHandle, rows, rhs, 1, rScaled, 1) != CUBLAS_STATUS_SUCCESS)
+        {
+            message = word("ChebCopyResidual");
+            return false;
+        }
+        if
+        (
+            cublasDdgmm
+            (
+                cublasHandle,
+                CUBLAS_SIDE_LEFT,
+                rows,
+                1,
+                rScaled,
+                rows,
+                preconCacheEntry->d_invSqrtDiag,
+                1,
+                rScaled,
+                rows
+            ) != CUBLAS_STATUS_SUCCESS
+        )
+        {
+            message = word("ChebScaleResidual");
+            return false;
+        }
+
+        if (cudaMemset(pScaled, 0, sizeof(double)*rows) != cudaSuccess)
+        {
+            message = word("ChebZeroDirection");
+            return false;
+        }
+        if (cudaMemset(out, 0, sizeof(DeviceScalar)*rows) != cudaSuccess)
+        {
+            message = word("ChebZeroOut");
+            return false;
+        }
+
+        for (label iter = 0; iter < chebyshevDegree; ++iter)
+        {
+            if (iter == 0)
+            {
+                beta = 0.0;
+                alpha = 1.0/theta;
+            }
+            else
+            {
+                beta = std::pow(delta * alphaPrev * 0.5, 2);
+                double denom = theta - beta/alphaPrev;
+                if (std::fabs(denom) <= VSMALL)
+                {
+                    denom = theta;
+                }
+                alpha = 1.0/denom;
+            }
+
+            if (beta != 0.0)
+            {
+                if (cublasDscal(cublasHandle, rows, &beta, pScaled, 1) != CUBLAS_STATUS_SUCCESS)
+                {
+                    message = word("ChebScaleP");
+                    return false;
+                }
+                if (cublasDaxpy(cublasHandle, rows, &oneD, rScaled, 1, pScaled, 1) != CUBLAS_STATUS_SUCCESS)
+                {
+                    message = word("ChebUpdateP");
+                    return false;
+                }
+            }
+            else
+            {
+                if (cublasDcopy(cublasHandle, rows, rScaled, 1, pScaled, 1) != CUBLAS_STATUS_SUCCESS)
+                {
+                    message = word("ChebCopyP");
+                    return false;
+                }
+            }
+
+            if (!scaledSpMV(ApScaled, pScaled))
+            {
+                return false;
+            }
+
+            if (cublasDaxpy(cublasHandle, rows, &alpha, pScaled, 1, out, 1) != CUBLAS_STATUS_SUCCESS)
+            {
+                message = word("ChebUpdateZ");
+                return false;
+            }
+            const double negAlpha = -alpha;
+            if (cublasDaxpy(cublasHandle, rows, &negAlpha, ApScaled, 1, rScaled, 1) != CUBLAS_STATUS_SUCCESS)
+            {
+                message = word("ChebUpdateResidual");
+                return false;
+            }
+
+            alphaPrev = alpha;
+        }
+
+        if
+        (
+            cublasDdgmm
+            (
+                cublasHandle,
+                CUBLAS_SIDE_LEFT,
+                rows,
+                1,
+                out,
+                rows,
+                preconCacheEntry->d_invSqrtDiag,
+                1,
+                out,
+                rows
+            ) != CUBLAS_STATUS_SUCCESS
+        )
+        {
+            message = word("ChebUnscale");
+            return false;
+        }
+
+        double zNorm = 0.0;
+        if (cublasDnrm2(cublasHandle, rows, out, 1, &zNorm) != CUBLAS_STATUS_SUCCESS)
+        {
+            message = word("ChebNormFail");
+            return false;
+        }
+        double rzCheck = 0.0;
+        if (cublasDdot(cublasHandle, rows, rhs, 1, out, 1, &rzCheck) != CUBLAS_STATUS_SUCCESS)
+        {
+            message = word("ChebDotFail");
+            return false;
+        }
+        if (!std::isfinite(zNorm) || !std::isfinite(rzCheck) || zNorm <= 0 || rzCheck <= 0)
+        {
+            chebyshevGuardrailTriggered = true;
+            cudaMemset(out, 0, sizeof(DeviceScalar)*rows);
+            return false;
+        }
+
+        chebyshevSpdApplied = true;
+        return true;
     };
 
     auto syncStream = [&]() -> bool
@@ -1871,20 +4582,28 @@ using DeviceScalar = double;
         }
     }
 
+    if (equilibrateMatrix)
+    {
+        populateOperatorArrays();
+    }
+
     // Copy values
-    if (cudaMemcpy(d_vals, values.begin(), sizeof(DeviceScalar)*nnz, cudaMemcpyHostToDevice) != cudaSuccess)
+    if (cudaMemcpy(d_vals, spmvValsHost.begin(), sizeof(DeviceScalar)*nnz, cudaMemcpyHostToDevice) != cudaSuccess)
         return fail("cudaMemcpy(vals)");
     if (cudaMemcpy(d_rowPtr, rowPtr.begin(), sizeof(int)*(rows+1), cudaMemcpyHostToDevice) != cudaSuccess)
         return fail("cudaMemcpy(rowPtr)");
     if (cudaMemcpy(d_colInd, colInd.begin(), sizeof(int)*nnz, cudaMemcpyHostToDevice) != cudaSuccess)
         return fail("cudaMemcpy(colInd)");
+
     if (equilibrateMatrix)
     {
         List<DeviceScalar> xScaled(rows), bScaled(rows);
         for (int i = 0; i < rows; ++i)
         {
-            xScaled[i] = static_cast<DeviceScalar>(static_cast<double>(psi[i]) * static_cast<double>(invScaleHost[i]));
-            bScaled[i] = static_cast<DeviceScalar>(static_cast<double>(source[i]) * static_cast<double>(scaleHost[i]));
+            const double psiVal = static_cast<double>(psi[i]) * static_cast<double>(invScaleHost[i]);
+            const double rhsVal = static_cast<double>(source[i]) * static_cast<double>(scaleHost[i]);
+            xScaled[i] = static_cast<DeviceScalar>(psiVal);
+            bScaled[i] = static_cast<DeviceScalar>(rhsVal);
         }
         if (cudaMemcpy(d_x, xScaled.begin(), sizeof(DeviceScalar)*rows, cudaMemcpyHostToDevice) != cudaSuccess)
             return fail("cudaMemcpy(xScaled)");
@@ -1895,8 +4614,21 @@ using DeviceScalar = double;
     {
         if (cudaMemcpy(d_x, psi.begin(), sizeof(DeviceScalar)*rows, cudaMemcpyHostToDevice) != cudaSuccess)
             return fail("cudaMemcpy(x)");
-        if (cudaMemcpy(d_b, source.begin(), sizeof(DeviceScalar)*rows, cudaMemcpyHostToDevice) != cudaSuccess)
-            return fail("cudaMemcpy(b)");
+        if (matvecSignD == 1.0)
+        {
+            if (cudaMemcpy(d_b, source.begin(), sizeof(DeviceScalar)*rows, cudaMemcpyHostToDevice) != cudaSuccess)
+                return fail("cudaMemcpy(b)");
+        }
+        else
+        {
+            List<DeviceScalar> bHost(rows);
+            for (int i = 0; i < rows; ++i)
+            {
+                bHost[i] = static_cast<DeviceScalar>(matvecSignD * static_cast<double>(source[i]));
+            }
+            if (cudaMemcpy(d_b, bHost.begin(), sizeof(DeviceScalar)*rows, cudaMemcpyHostToDevice) != cudaSuccess)
+                return fail("cudaMemcpy(bScaledSign)");
+        }
     }
     if (cudaMemcpy(d_diagInv, diagInv.begin(), sizeof(DeviceScalar)*rows, cudaMemcpyHostToDevice) != cudaSuccess)
         return fail("cudaMemcpy(diagInv)");
@@ -1936,20 +4668,26 @@ using DeviceScalar = double;
     if (cublasCreate(&cublasHandle) != CUBLAS_STATUS_SUCCESS)
         return fail("cublasCreate");
 
+    if (cublasSetPointerMode(cublasHandle, CUBLAS_POINTER_MODE_HOST) != CUBLAS_STATUS_SUCCESS)
+        return fail("cublasSetPointerMode");
+
+    cudaStream_t solverStream = nullptr;
     if (usePipelinedCG || useCudaGraph)
     {
         if (cudaStreamCreateWithFlags(&computeStream, cudaStreamNonBlocking) != cudaSuccess)
         {
             return fail("cudaStreamCreate");
         }
-        if (cublasSetStream(cublasHandle, computeStream) != CUBLAS_STATUS_SUCCESS)
-        {
-            return fail("cublasSetStream");
-        }
-        if (cusparseSetStream(cusparseHandle, computeStream) != CUSPARSE_STATUS_SUCCESS)
-        {
-            return fail("cusparseSetStream");
-        }
+        solverStream = computeStream;
+    }
+
+    if (cublasSetStream(cublasHandle, solverStream) != CUBLAS_STATUS_SUCCESS)
+    {
+        return fail("cublasSetStream");
+    }
+    if (cusparseSetStream(cusparseHandle, solverStream) != CUSPARSE_STATUS_SUCCESS)
+    {
+        return fail("cusparseSetStream");
     }
 
     if
@@ -1971,6 +4709,117 @@ using DeviceScalar = double;
     )
     {
         return fail("cusparseCreateCsr");
+    }
+
+    if (reportStats && (!Pstream::parRun() || Pstream::master()) && rows > 0)
+    {
+        DeviceScalar* d_nullIn = nullptr;
+        DeviceScalar* d_nullOut = nullptr;
+        if
+        (
+            cudaMalloc(reinterpret_cast<void**>(&d_nullIn), sizeof(DeviceScalar)*rows) == cudaSuccess
+         && cudaMalloc(reinterpret_cast<void**>(&d_nullOut), sizeof(DeviceScalar)*rows) == cudaSuccess
+        )
+        {
+            std::vector<double> onesHost(static_cast<std::size_t>(rows), 1.0);
+            if
+            (
+                cudaMemcpy
+                (
+                    d_nullIn,
+                    onesHost.data(),
+                    sizeof(DeviceScalar)*rows,
+                    cudaMemcpyHostToDevice
+                ) == cudaSuccess
+             && cudaMemset(d_nullOut, 0, sizeof(DeviceScalar)*rows) == cudaSuccess
+            )
+            {
+                cusparseDnVecDescr_t nullInDesc = nullptr;
+                cusparseDnVecDescr_t nullOutDesc = nullptr;
+                if
+                (
+                    cusparseCreateDnVec(&nullInDesc, rows, d_nullIn, CUDA_R_64F) == CUSPARSE_STATUS_SUCCESS
+                 && cusparseCreateDnVec(&nullOutDesc, rows, d_nullOut, CUDA_R_64F) == CUSPARSE_STATUS_SUCCESS
+                )
+                {
+                    const double alphaNull = 1.0;
+                    const double betaNull = 0.0;
+                    size_t nullBufferSize = 0;
+                    void* nullBuffer = nullptr;
+                    cusparseStatus_t bufStatus =
+                        cusparseSpMV_bufferSize
+                        (
+                            cusparseHandle,
+                            CUSPARSE_OPERATION_NON_TRANSPOSE,
+                            &alphaNull,
+                            matA,
+                            nullInDesc,
+                            &betaNull,
+                            nullOutDesc,
+                            CUDA_R_64F,
+                            CUSPARSE_SPMV_ALG_DEFAULT,
+                            &nullBufferSize
+                        );
+                    if
+                    (
+                        bufStatus == CUSPARSE_STATUS_SUCCESS
+                     && nullBufferSize > 0
+                     && cudaMalloc(&nullBuffer, nullBufferSize) != cudaSuccess
+                    )
+                    {
+                        nullBuffer = nullptr;
+                    }
+                    cusparseStatus_t nsStatus =
+                        cusparseSpMV
+                        (
+                            cusparseHandle,
+                            CUSPARSE_OPERATION_NON_TRANSPOSE,
+                            &alphaNull,
+                            matA,
+                            nullInDesc,
+                            &betaNull,
+                            nullOutDesc,
+                            CUDA_R_64F,
+                            CUSPARSE_SPMV_ALG_DEFAULT,
+                            nullBuffer ? nullBuffer : nullptr
+                        );
+                    if (nullBuffer)
+                    {
+                        cudaFree(nullBuffer);
+                    }
+                    if (nsStatus == CUSPARSE_STATUS_SUCCESS)
+                    {
+                        std::vector<double> nullOutHost(static_cast<std::size_t>(rows), 0.0);
+                        if
+                        (
+                            cudaMemcpy
+                            (
+                                nullOutHost.data(),
+                                d_nullOut,
+                                sizeof(DeviceScalar)*rows,
+                                cudaMemcpyDeviceToHost
+                            ) == cudaSuccess
+                        )
+                        {
+                            double nullNorm = 0.0;
+                            double maxAbsNull = 0.0;
+                            for (double v : nullOutHost)
+                            {
+                                nullNorm += v*v;
+                                maxAbsNull = std::max(maxAbsNull, std::fabs(v));
+                            }
+                            nullNorm = std::sqrt(std::max(0.0, nullNorm));
+                            Info<< "cudaPCG(" << fieldName_ << "): nullspace check |A*1|_2="
+                                << nullNorm << " max|A*1|=" << maxAbsNull << nl;
+                        }
+                    }
+                }
+                if (nullInDesc) cusparseDestroyDnVec(nullInDesc);
+                if (nullOutDesc) cusparseDestroyDnVec(nullOutDesc);
+            }
+        }
+        if (d_nullIn) cudaFree(d_nullIn);
+        if (d_nullOut) cudaFree(d_nullOut);
     }
 
     if (cusparseCreateDnVec(&vecX, rows, d_x, CUDA_R_64F) != CUSPARSE_STATUS_SUCCESS)
@@ -2010,7 +4859,7 @@ using DeviceScalar = double;
                 if (j <= i)
                 {
                     preColIndHost[cursor] = j;
-                    DeviceScalar v = values[k];
+                    DeviceScalar v = static_cast<DeviceScalar>(matvecSignD * static_cast<double>(values[k]));
                     if (j == i)
                     {
                         // Use regularised diagonal; if equilibrated, account for scaling (s_i^2)
@@ -2169,6 +5018,9 @@ using DeviceScalar = double;
     bool iluReady = false;
     bool icReady = false;
     std::string iluDisableReason;
+    bool icCacheWasAllowed = false;
+    bool icRefactorThisSolve = false;
+    label icShiftAppliedSolve = 0;
     if ((useILU || useIC) && !preIn)
     {
         if (cusparseCreateDnVec(&preIn, rows, d_preTmp, CUDA_R_64F) != CUSPARSE_STATUS_SUCCESS)
@@ -2183,23 +5035,91 @@ using DeviceScalar = double;
     }
     if (useILU || useIC)
     {
+        int* factorRowPtrDev =
+            (permutationActive && preconCacheEntry && preconCacheEntry->icPatternReady)
+          ? preconCacheEntry->d_icRowPtr
+          : d_rowPtr;
+        int* factorColIndDev =
+            (permutationActive && preconCacheEntry && preconCacheEntry->icPatternReady)
+          ? preconCacheEntry->d_icColInd
+          : d_colInd;
+
         // Allocate separate values array for in-place factorization
         // Start from host values and apply diagonal regularisation specifically for ILU/IC
         List<DeviceScalar> iluValsHost(nnz);
-        for (int i = 0; i < nnz; ++i) iluValsHost[i] = values[i];
-
+        List<int> diagPositions(rows, -1);
         const scalar iluDiagAbsFloorCfg = dict.lookupOrDefault<scalar>("iluDiagAbsFloor", diagFloorCfg);
         const scalar iluDiagRelFloorCfg = dict.lookupOrDefault<scalar>("iluDiagRelFloor", scalar(0));
         const double iluDiagFloorEff = std::max(static_cast<double>(iluDiagAbsFloorCfg), static_cast<double>(iluDiagRelFloorCfg)*static_cast<double>(maxAbsDiag));
-
-        if (useIC || useILU)
+        const bool allowIcCache = useIC && !useILU && preconCacheEntry;
+        const Foam::scalar icRefactorMultiplier = scalar(1.5);
+        bool reuseIcNumeric = false;
+        bool requireNumericFactor = true;
+        if (useIC && allowIcCache && preconCacheEntry->icFactorValid && preconCacheEntry->icAnalysisReady)
         {
+            const Foam::scalar medianIters = preconCacheEntry->icRollingMedian;
+            const Foam::label lastIters = preconCacheEntry->icLastIterations;
+            const bool refactorDueToMedian =
+                (medianIters > VSMALL)
+             && (static_cast<Foam::scalar>(lastIters) > icRefactorMultiplier*medianIters);
+            const bool refactorDueToPivot = preconCacheEntry->icHadZeroPivot;
+            if (!refactorDueToMedian && !refactorDueToPivot)
+            {
+                reuseIcNumeric = true;
+                requireNumericFactor = false;
+            }
+        }
+        if (reuseIcNumeric)
+        {
+            const double cachedScale = preconCacheEntry->icFactorScale;
+            const double scaleTolerance =
+                1e-8*std::max(std::max(std::fabs(cachedScale), std::fabs(factorScale)), 1.0);
+            if (std::fabs(cachedScale - factorScale) > scaleTolerance)
+            {
+                reuseIcNumeric = false;
+                requireNumericFactor = true;
+            }
+        }
+        if (reuseIcNumeric)
+        {
+            if
+            (
+                !preconCacheEntry->d_icVals
+             || preconCacheEntry->icCapacityNnz != nnz
+             || !preconCacheEntry->icInfo
+            )
+            {
+                reuseIcNumeric = false;
+                requireNumericFactor = true;
+            }
+            else
+            {
+                ++preconCacheEntry->icFactorReuseHits;
+                factorScale = preconCacheEntry->icFactorScale;
+            }
+        }
+        label icShiftApplied = 0;
+        icCacheWasAllowed = allowIcCache;
+        const bool buildNumericFactors = useILU || requireNumericFactor;
+        std::vector<std::pair<double, Foam::label>> shiftTraceSolve;
+
+        if (buildNumericFactors)
+        {
+            for (int i = 0; i < nnz; ++i)
+            {
+                iluValsHost[i] = factorValsNumeric[i];
+            }
+
             for (int i = 0; i < rows; ++i)
             {
                 int diagK = -1;
-                for (int k = rowPtr[i]; k < rowPtr[i+1]; ++k)
+                for (int k = factorRowPtrHost[i]; k < factorRowPtrHost[i+1]; ++k)
                 {
-                    if (colInd[k] == i) { diagK = k; break; }
+                    if (factorColIndHost[k] == i)
+                    {
+                        diagK = k;
+                        break;
+                    }
                 }
                 if (diagK >= 0)
                 {
@@ -2207,27 +5127,101 @@ using DeviceScalar = double;
                     if (useIC)
                     {
                         // IC0 expects positive diagonals
-                        if (dv <= 0.0 || std::abs(dv) < iluDiagFloorEff) dv = iluDiagFloorEff;
+                        const Foam::label origRow = permutationActive ? permutation[i] : i;
+                        double s = 1.0;
+                        if (scaleIcFactors && origRow < invSqrtDiagHost.size())
+                        {
+                            s = static_cast<double>(invSqrtDiagHost[origRow]);
+                        }
+                        double scaleSq = s*s;
+                        if (!std::isfinite(scaleSq) || scaleSq <= 0.0)
+                        {
+                            scaleSq = 1.0;
+                        }
+                        const double diagFloorScaled = iluDiagFloorEff * scaleSq;
+                        if (dv <= 0.0 || std::abs(dv) < diagFloorScaled)
+                        {
+                            dv = diagFloorScaled;
+                        }
                     }
                     else
                     {
                         // ILU0: avoid near-zero diagonals, preserve sign
-                        if (std::abs(dv) < iluDiagFloorEff) dv = (dv >= 0.0 ? iluDiagFloorEff : -iluDiagFloorEff);
+                        if (std::abs(dv) < iluDiagFloorEff)
+                        {
+                            dv = (dv >= 0.0 ? iluDiagFloorEff : -iluDiagFloorEff);
+                        }
                     }
                     iluValsHost[diagK] = static_cast<DeviceScalar>(dv);
+                    diagPositions[i] = diagK;
                 }
+            }
+            if (icDebugDump && reportStats && Pstream::master())
+            {
+                double diagMinTest = std::numeric_limits<double>::max();
+                double diagMaxTest = -std::numeric_limits<double>::max();
+                for (int i = 0; i < rows; ++i)
+                {
+                    const int diagK = diagPositions[i];
+                    if (diagK >= 0)
+                    {
+                        const double dv = static_cast<double>(iluValsHost[diagK]);
+                        diagMinTest = std::min(diagMinTest, dv);
+                        diagMaxTest = std::max(diagMaxTest, dv);
+                    }
+                }
+                Info<< "cudaPCG(" << fieldName_ << "): IC host diag pre-factor range ["
+                    << diagMinTest << ", " << diagMaxTest << ']' << nl;
             }
         }
 
-        if (cudaMalloc(reinterpret_cast<void**>(&d_iluVals), sizeof(DeviceScalar)*nnz) != cudaSuccess)
+        if (allowIcCache && iluDisableReason.empty())
         {
-            iluDisableReason = std::string("allocVals");
+            if (requireNumericFactor)
+            {
+                if (!preconCacheEntry->ensureIcCapacity(nnz))
+                {
+                    iluDisableReason = std::string("allocVals");
+                }
+                else
+                {
+                    d_iluVals = reinterpret_cast<DeviceScalar*>(preconCacheEntry->d_icVals);
+                    d_iluValsFromCache = true;
+                }
+            }
+            else
+            {
+                d_iluVals = reinterpret_cast<DeviceScalar*>(preconCacheEntry->d_icVals);
+                d_iluValsFromCache = true;
+            }
         }
-        else if (cudaMemcpy(d_iluVals, iluValsHost.begin(), sizeof(DeviceScalar)*nnz, cudaMemcpyHostToDevice) != cudaSuccess)
+
+        if (!d_iluVals && iluDisableReason.empty())
         {
-            iluDisableReason = std::string("copyVals");
+            if (cudaMalloc(reinterpret_cast<void**>(&d_iluVals), sizeof(DeviceScalar)*nnz) != cudaSuccess)
+            {
+                iluDisableReason = std::string("allocVals");
+            }
         }
-        else if (cusparseCreateMatDescr(&iluDescr) != CUSPARSE_STATUS_SUCCESS)
+
+        if (requireNumericFactor && iluDisableReason.empty())
+        {
+            if
+            (
+                cudaMemcpy
+                (
+                    d_iluVals,
+                    iluValsHost.begin(),
+                    sizeof(DeviceScalar)*nnz,
+                    cudaMemcpyHostToDevice
+                ) != cudaSuccess
+            )
+            {
+                iluDisableReason = std::string("copyVals");
+            }
+        }
+
+        if (iluDisableReason.empty() && cusparseCreateMatDescr(&iluDescr) != CUSPARSE_STATUS_SUCCESS)
         {
             iluDisableReason = std::string("createDescr");
         }
@@ -2254,7 +5248,7 @@ using DeviceScalar = double;
                             cusparseHandle, rows, nnz,
                             iluDescr,
                             reinterpret_cast<double*>(d_iluVals),
-                            d_rowPtr, d_colInd,
+                            factorRowPtrDev, factorColIndDev,
                             iluInfo, &bs
                         ) == CUSPARSE_STATUS_SUCCESS
                      && (bs == 0 || cudaMalloc(&iluBuf, bs) == cudaSuccess)
@@ -2263,7 +5257,7 @@ using DeviceScalar = double;
                             cusparseHandle, rows, nnz,
                             iluDescr,
                             reinterpret_cast<double*>(d_iluVals),
-                            d_rowPtr, d_colInd,
+                            factorRowPtrDev, factorColIndDev,
                             iluInfo, CUSPARSE_SOLVE_POLICY_NO_LEVEL,
                             iluBuf
                         ) == CUSPARSE_STATUS_SUCCESS
@@ -2283,7 +5277,7 @@ using DeviceScalar = double;
                             cusparseHandle, rows, nnz,
                             iluDescr,
                             reinterpret_cast<double*>(d_iluVals),
-                            d_rowPtr, d_colInd,
+                            factorRowPtrDev, factorColIndDev,
                             iluInfo, CUSPARSE_SOLVE_POLICY_NO_LEVEL,
                             iluBuf
                         ) == CUSPARSE_STATUS_SUCCESS
@@ -2300,9 +5294,9 @@ using DeviceScalar = double;
                         {
                         if
                         (
-                            cusparseCreateCsr(&matL, rows, rows, nnz, d_rowPtr, d_colInd, d_iluVals,
+                            cusparseCreateCsr(&matL, rows, rows, nnz, factorRowPtrDev, factorColIndDev, d_iluVals,
                                 CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F) == CUSPARSE_STATUS_SUCCESS
-                         && cusparseCreateCsr(&matU, rows, rows, nnz, d_rowPtr, d_colInd, d_iluVals,
+                         && cusparseCreateCsr(&matU, rows, rows, nnz, factorRowPtrDev, factorColIndDev, d_iluVals,
                                 CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F) == CUSPARSE_STATUS_SUCCESS
                          && cusparseSpSV_createDescr(&spsvLowerIlu) == CUSPARSE_STATUS_SUCCESS
                          && cusparseSpSV_createDescr(&spsvUpperIlu) == CUSPARSE_STATUS_SUCCESS
@@ -2400,8 +5394,47 @@ using DeviceScalar = double;
             }
             else if (useIC)
             {
-                if (cusparseCreateCsric02Info(&icInfo) == CUSPARSE_STATUS_SUCCESS)
+                csric02Info_t icInfoLocal = nullptr;
+                bool analysisRequired = true;
+                bool factorSuccess = false;
+                if (!requireNumericFactor)
                 {
+                    factorSuccess = true;
+                }
+
+                if (allowIcCache)
+                {
+                    if (!preconCacheEntry->icInfo)
+                    {
+                        if (cusparseCreateCsric02Info(&preconCacheEntry->icInfo) != CUSPARSE_STATUS_SUCCESS)
+                        {
+                            iluDisableReason = std::string("createInfo");
+                        }
+                    }
+                    if (iluDisableReason.empty())
+                    {
+                        icInfoLocal = preconCacheEntry->icInfo;
+                        icInfoFromCache = true;
+                        analysisRequired = !preconCacheEntry->icAnalysisReady;
+                    }
+                }
+
+                if (!icInfoLocal && iluDisableReason.empty())
+                {
+                    if (cusparseCreateCsric02Info(&icInfoLocal) != CUSPARSE_STATUS_SUCCESS)
+                    {
+                        iluDisableReason = std::string("createInfo");
+                    }
+                }
+
+                if (!requireNumericFactor)
+                {
+                    analysisRequired = false;
+                }
+
+                if (iluDisableReason.empty())
+                {
+                    icInfo = icInfoLocal;
                     int bs = 0;
                     if
                     (
@@ -2410,133 +5443,437 @@ using DeviceScalar = double;
                             cusparseHandle, rows, nnz,
                             iluDescr,
                             reinterpret_cast<double*>(d_iluVals),
-                            d_rowPtr, d_colInd,
+                            factorRowPtrDev, factorColIndDev,
                             icInfo, &bs
-                        ) == CUSPARSE_STATUS_SUCCESS
-                     && (bs == 0 || cudaMalloc(&iluBuf, bs) == cudaSuccess)
-                     && cusparseDcsric02_analysis
-                        (
-                            cusparseHandle, rows, nnz,
-                            iluDescr,
-                            reinterpret_cast<double*>(d_iluVals),
-                            d_rowPtr, d_colInd,
-                            icInfo, CUSPARSE_SOLVE_POLICY_NO_LEVEL,
-                            iluBuf
-                        ) == CUSPARSE_STATUS_SUCCESS
-                     && cusparseDcsric02
-                        (
-                            cusparseHandle, rows, nnz,
-                            iluDescr,
-                            reinterpret_cast<double*>(d_iluVals),
-                            d_rowPtr, d_colInd,
-                            icInfo, CUSPARSE_SOLVE_POLICY_NO_LEVEL,
-                            iluBuf
-                        ) == CUSPARSE_STATUS_SUCCESS
+                        ) != CUSPARSE_STATUS_SUCCESS
                     )
                     {
-                        // Zero pivot check (IC0)
-                        int pivot = -1;
-                        cusparseStatus_t zp = cusparseXcsric02_zeroPivot(cusparseHandle, icInfo, &pivot);
-                        if (zp == CUSPARSE_STATUS_ZERO_PIVOT)
+                        iluDisableReason = std::string("csric02Buffer");
+                    }
+                    else
+                    {
+                        iluBufSize = static_cast<size_t>(bs);
+                        if (allowIcCache)
                         {
-                            iluDisableReason = std::string("zeroPivot");
-                        }
-                        else
-                        {
-                        if
-                        (
-                            cusparseCreateCsr(&matLchol, rows, rows, nnz, d_rowPtr, d_colInd, d_iluVals,
-                                CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F) == CUSPARSE_STATUS_SUCCESS
-                         && cusparseSpSV_createDescr(&spsvLowerChol) == CUSPARSE_STATUS_SUCCESS
-                         && cusparseSpSV_createDescr(&spsvUpperTChol) == CUSPARSE_STATUS_SUCCESS
-                        )
-                        {
-                            cusparseFillMode_t fillL = CUSPARSE_FILL_MODE_LOWER;
-                            cusparseDiagType_t diagType = CUSPARSE_DIAG_TYPE_NON_UNIT;
-                            cusparseSpMatSetAttribute(matLchol, CUSPARSE_SPMAT_FILL_MODE, &fillL, sizeof(fillL));
-                            cusparseSpMatSetAttribute(matLchol, CUSPARSE_SPMAT_DIAG_TYPE, &diagType, sizeof(diagType));
-
-                            const double oneD = 1.0; size_t bL=0, bUT=0;
-                            if
-                            (
-                                cusparseSpSV_bufferSize
-                                (
-                                    cusparseHandle,
-                                    CUSPARSE_OPERATION_NON_TRANSPOSE,
-                                    &oneD,
-                                    matLchol,
-                                    preIn,
-                                    preOut,
-                                    CUDA_R_64F,
-                                    CUSPARSE_SPSV_ALG_DEFAULT,
-                                    spsvLowerChol,
-                                    &bL
-                                ) == CUSPARSE_STATUS_SUCCESS
-                             && cusparseSpSV_bufferSize
-                                (
-                                    cusparseHandle,
-                                    CUSPARSE_OPERATION_TRANSPOSE,
-                                    &oneD,
-                                    matLchol,
-                                    preIn,
-                                    preOut,
-                                    CUDA_R_64F,
-                                    CUSPARSE_SPSV_ALG_DEFAULT,
-                                    spsvUpperTChol,
-                                    &bUT
-                                ) == CUSPARSE_STATUS_SUCCESS
-                            )
+                            if (!preconCacheEntry->ensureIcBuffer(iluBufSize))
                             {
-                                iluBufSize = std::max(iluBufSize, std::max(bL, bUT));
-                                if ((iluBufSize == 0) || (cudaMalloc(&iluBuf, iluBufSize) == cudaSuccess))
-                                {
-                                    if
-                                    (
-                                        cusparseSpSV_analysis
-                                        (
-                                            cusparseHandle,
-                                            CUSPARSE_OPERATION_NON_TRANSPOSE,
-                                            &oneD,
-                                            matLchol,
-                                            preIn,
-                                            preOut,
-                                            CUDA_R_64F,
-                                            CUSPARSE_SPSV_ALG_DEFAULT,
-                                            spsvLowerChol,
-                                            iluBuf
-                                        ) == CUSPARSE_STATUS_SUCCESS
-                                     && cusparseSpSV_analysis
-                                        (
-                                            cusparseHandle,
-                                            CUSPARSE_OPERATION_TRANSPOSE,
-                                            &oneD,
-                                            matLchol,
-                                            preIn,
-                                            preOut,
-                                            CUDA_R_64F,
-                                            CUSPARSE_SPSV_ALG_DEFAULT,
-                                            spsvUpperTChol,
-                                            iluBuf
-                                        ) == CUSPARSE_STATUS_SUCCESS
-                                    )
-                                    {
-                                        icReady = true;
-                                    }
-                                }
+                                iluDisableReason = std::string("allocBuf");
+                            }
+                            else
+                            {
+                                iluBuf = preconCacheEntry->icBuffer;
+                                icBufferFromCache = true;
                             }
                         }
+                        if (!icBufferFromCache)
+                        {
+                            if (iluBufSize && cudaMalloc(&iluBuf, iluBufSize) != cudaSuccess)
+                            {
+                                iluDisableReason = std::string("allocBuf");
+                            }
+                        }
+                    }
+                }
+
+                if (iluDisableReason.empty() && analysisRequired)
+                {
+                    if
+                    (
+                        cusparseDcsric02_analysis
+                        (
+                            cusparseHandle, rows, nnz,
+                            iluDescr,
+                            reinterpret_cast<double*>(d_iluVals),
+                            factorRowPtrDev, factorColIndDev,
+                            icInfo, CUSPARSE_SOLVE_POLICY_NO_LEVEL,
+                            iluBuf
+                        ) != CUSPARSE_STATUS_SUCCESS
+                    )
+                    {
+                        iluDisableReason = std::string("csric02Analysis");
+                    }
+                    else if (allowIcCache)
+                    {
+                        preconCacheEntry->icAnalysisReady = true;
+                    }
+                }
+                else if (iluDisableReason.empty() && allowIcCache)
+                {
+                    ++preconCacheEntry->icAnalysisReuseHits;
+                }
+
+                if (requireNumericFactor && iluDisableReason.empty())
+                {
+                    const double diagMedianScaled = icDiagMedianScaled;
+                    List<DeviceScalar> iluValsBase(iluValsHost);
+
+                    cusparseStatus_t status =
+                        cusparseDcsric02
+                        (
+                            cusparseHandle, rows, nnz,
+                            iluDescr,
+                            reinterpret_cast<double*>(d_iluVals),
+                            factorRowPtrDev, factorColIndDev,
+                            icInfo, CUSPARSE_SOLVE_POLICY_NO_LEVEL,
+                            iluBuf
+                        );
+                    if (status == CUSPARSE_STATUS_SUCCESS)
+                    {
+                        factorSuccess = true;
+                        shiftTraceSolve.emplace_back(0.0, -1);
+                    }
+#if defined(CUSPARSE_STATUS_NUMERICAL_ERROR)
+                    else if
+                    (
+                        status == CUSPARSE_STATUS_ZERO_PIVOT
+                     || status == CUSPARSE_STATUS_NUMERICAL_ERROR
+                    )
+#else
+                    else if (status == CUSPARSE_STATUS_ZERO_PIVOT)
+#endif
+                    {
+                        int pivot = -1;
+                        cusparseXcsric02_zeroPivot(cusparseHandle, icInfo, &pivot);
+                        shiftTraceSolve.emplace_back(0.0, static_cast<Foam::label>(pivot));
+                        const std::array<double, 10> shiftTau = {1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0};
+                        for (double tau : shiftTau)
+                        {
+                            double shiftAmount =
+                                tau * (diagMedianScaled > 0.0 ? diagMedianScaled : static_cast<double>(diagFloorCfg));
+                            if (shiftAmount <= 0.0)
+                            {
+                                shiftAmount = tau * std::max(static_cast<double>(diagFloorCfg), 1e-12);
+                            }
+                            iluValsHost = iluValsBase;
+                            for (int r = 0; r < rows; ++r)
+                            {
+                                const int diagPos = diagPositions[r];
+                                if (diagPos >= 0)
+                                {
+                                    double updated = static_cast<double>(iluValsHost[diagPos]) + shiftAmount;
+                                    if (updated <= 0.0) updated = shiftAmount;
+                                    iluValsHost[diagPos] = static_cast<DeviceScalar>(updated);
+                                }
+                            }
+                            if
+                            (
+                                cudaMemcpy
+                                (
+                                    d_iluVals,
+                                    iluValsHost.begin(),
+                                    sizeof(DeviceScalar)*nnz,
+                                    cudaMemcpyHostToDevice
+                                ) != cudaSuccess
+                            )
+                            {
+                                iluDisableReason = std::string("copyValsShift");
+                                break;
+                            }
+                            ++icShiftApplied;
+                            status =
+                                cusparseDcsric02
+                                (
+                                    cusparseHandle, rows, nnz,
+                                    iluDescr,
+                                    reinterpret_cast<double*>(d_iluVals),
+                                    factorRowPtrDev, factorColIndDev,
+                                    icInfo, CUSPARSE_SOLVE_POLICY_NO_LEVEL,
+                                    iluBuf
+                                );
+                            int pivotIdx = -1;
+#if defined(CUSPARSE_STATUS_NUMERICAL_ERROR)
+                            if
+                            (
+                                status == CUSPARSE_STATUS_ZERO_PIVOT
+                             || status == CUSPARSE_STATUS_NUMERICAL_ERROR
+                            )
+#else
+                            if (status == CUSPARSE_STATUS_ZERO_PIVOT)
+#endif
+                            {
+                                cusparseXcsric02_zeroPivot(cusparseHandle, icInfo, &pivotIdx);
+                                shiftTraceSolve.emplace_back(tau, static_cast<Foam::label>(pivotIdx));
+                                continue;
+                            }
+                            else if (status == CUSPARSE_STATUS_SUCCESS)
+                            {
+                                factorSuccess = true;
+                                shiftTraceSolve.emplace_back(tau, -1);
+                                break;
+                            }
+                            else
+                            {
+                                iluDisableReason = std::string("csric02");
+                                break;
+                            }
                         }
                     }
                     else
                     {
                         iluDisableReason = std::string("csric02");
                     }
+
+                    if (!factorSuccess && iluDisableReason.empty())
+                    {
+                        iluDisableReason = std::string("csric02");
+                    }
                 }
-                else
+                else if (!requireNumericFactor && iluDisableReason.empty())
                 {
-                    iluDisableReason = std::string("createInfo");
+                    factorSuccess = true;
+                }
+
+                if (iluDisableReason.empty())
+                {
+                    if (icDebugDump && useIC && factorSuccess)
+                    {
+                        Info<< "cudaPCG(" << fieldName_ << "): IC debug dump triggered (nnz=" << nnz << ")" << nl;
+                        Foam::List<double> icValsHostDebug(nnz, 0.0);
+                        if
+                        (
+                            cudaMemcpy
+                            (
+                                icValsHostDebug.begin(),
+                                reinterpret_cast<const double*>(d_iluVals),
+                                sizeof(double)*nnz,
+                                cudaMemcpyDeviceToHost
+                            ) == cudaSuccess
+                        )
+                        {
+                            double minDiagIC = std::numeric_limits<double>::max();
+                            double maxDiagIC = -std::numeric_limits<double>::max();
+                            double minAbsDiagIC = std::numeric_limits<double>::max();
+                            double maxAbsDiagIC = 0.0;
+                            Foam::label diagCountIC = 0;
+                            Foam::label nonPosDiagIC = 0;
+                            for (int row = 0; row < rows; ++row)
+                            {
+                                const int diagPos = diagPositions[row];
+                                if (diagPos >= 0)
+                                {
+                                    const double diagVal = icValsHostDebug[diagPos];
+                                    minDiagIC = std::min(minDiagIC, diagVal);
+                                    maxDiagIC = std::max(maxDiagIC, diagVal);
+                                    const double absDiagVal = std::fabs(diagVal);
+                                    minAbsDiagIC = std::min(minAbsDiagIC, absDiagVal);
+                                    maxAbsDiagIC = std::max(maxAbsDiagIC, absDiagVal);
+                                    if (!std::isfinite(diagVal) || diagVal <= 0.0)
+                                    {
+                                        ++nonPosDiagIC;
+                                    }
+                                    ++diagCountIC;
+                                }
+                            }
+
+                            if (diagCountIC == 0)
+                            {
+                                minDiagIC = 0.0;
+                                maxDiagIC = 0.0;
+                                minAbsDiagIC = 0.0;
+                                maxAbsDiagIC = 0.0;
+                            }
+
+                            double minScale = std::numeric_limits<double>::max();
+                            double maxScale = 0.0;
+                            for (int i = 0; i < invSqrtDiagHost.size(); ++i)
+                            {
+                                const double scaleVal = static_cast<double>(invSqrtDiagHost[i]);
+                                const double absScale = std::fabs(scaleVal);
+                                if (absScale > 0.0)
+                                {
+                                    minScale = std::min(minScale, absScale);
+                                    maxScale = std::max(maxScale, absScale);
+                                }
+                            }
+
+                            double minRuiz = std::numeric_limits<double>::max();
+                            double maxRuiz = 0.0;
+                            if (icUseRuizScaling && preconCacheEntry && preconCacheEntry->ruizReady)
+                            {
+                                Foam::List<double> ruizHost(rows, 1.0);
+                                if
+                                (
+                                    cudaMemcpy
+                                    (
+                                        ruizHost.begin(),
+                                        preconCacheEntry->d_ruizScale,
+                                        sizeof(double)*rows,
+                                        cudaMemcpyDeviceToHost
+                                    ) == cudaSuccess
+                                )
+                                {
+                                    for (int i = 0; i < rows; ++i)
+                                    {
+                                        const double val = std::fabs(ruizHost[i]);
+                                        minRuiz = std::min(minRuiz, val);
+                                        maxRuiz = std::max(maxRuiz, val);
+                                    }
+                                }
+                            }
+
+                            Info<< "cudaPCG(" << fieldName_ << "): IC diag stats"
+                                << " min=" << minDiagIC
+                                << " max=" << maxDiagIC
+                                << " min|diag|=" << minAbsDiagIC
+                                << " max|diag|=" << maxAbsDiagIC
+                                << " nonPos=" << nonPosDiagIC
+                                << " scale|min,max|=" << minScale << ',' << maxScale;
+                            if (icUseRuizScaling && preconCacheEntry && preconCacheEntry->ruizReady)
+                            {
+                                Info<< " ruiz|min,max|=" << minRuiz << ',' << maxRuiz;
+                            }
+                            Info<< nl;
+                        }
+                        else
+                        {
+                            Info<< "cudaPCG(" << fieldName_ << "): IC diag stats unavailable (cudaMemcpy failure)" << nl;
+                        }
+                    }
+
+                    if
+                    (
+                        cusparseCreateCsr(&matLchol, rows, rows, nnz, factorRowPtrDev, factorColIndDev, d_iluVals,
+                            CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F) == CUSPARSE_STATUS_SUCCESS
+                     && cusparseSpSV_createDescr(&spsvLowerChol) == CUSPARSE_STATUS_SUCCESS
+                     && cusparseSpSV_createDescr(&spsvUpperTChol) == CUSPARSE_STATUS_SUCCESS
+                    )
+                    {
+                        cusparseFillMode_t fillL = CUSPARSE_FILL_MODE_LOWER;
+                        cusparseDiagType_t diagType = CUSPARSE_DIAG_TYPE_NON_UNIT;
+                        cusparseSpMatSetAttribute(matLchol, CUSPARSE_SPMAT_FILL_MODE, &fillL, sizeof(fillL));
+                        cusparseSpMatSetAttribute(matLchol, CUSPARSE_SPMAT_DIAG_TYPE, &diagType, sizeof(diagType));
+
+                        const double oneD = 1.0;
+                        size_t bL = 0, bUT = 0;
+                        if
+                        (
+                            cusparseSpSV_bufferSize
+                            (
+                                cusparseHandle,
+                                CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                &oneD,
+                                matLchol,
+                                preIn,
+                                preOut,
+                                CUDA_R_64F,
+                                CUSPARSE_SPSV_ALG_DEFAULT,
+                                spsvLowerChol,
+                                &bL
+                            ) == CUSPARSE_STATUS_SUCCESS
+                         && cusparseSpSV_bufferSize
+                            (
+                                cusparseHandle,
+                                CUSPARSE_OPERATION_TRANSPOSE,
+                                &oneD,
+                                matLchol,
+                                preIn,
+                                preOut,
+                                CUDA_R_64F,
+                                CUSPARSE_SPSV_ALG_DEFAULT,
+                                spsvUpperTChol,
+                                &bUT
+                            ) == CUSPARSE_STATUS_SUCCESS
+                        )
+                        {
+                            size_t requiredBuf = std::max(iluBufSize, std::max(bL, bUT));
+                            if (allowIcCache)
+                            {
+                                if (!preconCacheEntry->ensureIcBuffer(requiredBuf))
+                                {
+                                    iluDisableReason = std::string("allocBuf");
+                                }
+                                else
+                                {
+                                    iluBuf = preconCacheEntry->icBuffer;
+                                    icBufferFromCache = true;
+                                    iluBufSize = preconCacheEntry->icBufferSize;
+                                }
+                            }
+                            if (!icBufferFromCache)
+                            {
+                                if (requiredBuf && (iluBufSize < requiredBuf))
+                                {
+                                    if (iluBuf) cudaFree(iluBuf);
+                                    if (cudaMalloc(&iluBuf, requiredBuf) != cudaSuccess)
+                                    {
+                                        iluDisableReason = std::string("allocBuf");
+                                    }
+                                    else
+                                    {
+                                        iluBufSize = requiredBuf;
+                                    }
+                                }
+                            }
+                            if (iluDisableReason.empty())
+                            {
+                                if
+                                (
+                                    cusparseSpSV_analysis
+                                    (
+                                        cusparseHandle,
+                                        CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                        &oneD,
+                                        matLchol,
+                                        preIn,
+                                        preOut,
+                                        CUDA_R_64F,
+                                        CUSPARSE_SPSV_ALG_DEFAULT,
+                                        spsvLowerChol,
+                                        iluBuf
+                                    ) == CUSPARSE_STATUS_SUCCESS
+                                 && cusparseSpSV_analysis
+                                    (
+                                        cusparseHandle,
+                                        CUSPARSE_OPERATION_TRANSPOSE,
+                                        &oneD,
+                                        matLchol,
+                                        preIn,
+                                        preOut,
+                                        CUDA_R_64F,
+                                        CUSPARSE_SPSV_ALG_DEFAULT,
+                                        spsvUpperTChol,
+                                        iluBuf
+                                    ) == CUSPARSE_STATUS_SUCCESS
+                                )
+                                {
+                                    icReady = true;
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        iluDisableReason = std::string("csric02Mat");
+                    }
+                }
+
+                if (allowIcCache)
+                {
+                    preconCacheEntry->icShiftCounter += icShiftApplied;
+                    icRefactorThisSolve = requireNumericFactor && factorSuccess && icReady && iluDisableReason.empty();
+                    if (requireNumericFactor)
+                    {
+                        preconCacheEntry->icShiftTrace = shiftTraceSolve;
+                        if (factorSuccess && icReady && iluDisableReason.empty())
+                        {
+                            preconCacheEntry->icFactorValid = true;
+                            preconCacheEntry->icHadZeroPivot = icShiftApplied > 0;
+                            ++preconCacheEntry->icRefactorCount;
+                            preconCacheEntry->cachedMatvecSign = matvecSignD;
+                            preconCacheEntry->icFactorScale = factorScale;
+                            preconCacheEntry->icApplyScale = 1.0;
+                        }
+                        else
+                        {
+                            preconCacheEntry->icFactorValid = false;
+                            preconCacheEntry->icHadZeroPivot = false;
+                            preconCacheEntry->icFactorScale = 1.0;
+                            preconCacheEntry->icApplyScale = 1.0;
+                        }
+                    }
                 }
             }
+            icShiftAppliedSolve = icShiftApplied;
         }
     }
 
@@ -2604,8 +5941,8 @@ using DeviceScalar = double;
         }
 
         const double diagFloorLocal = colourDiagFloor;
-        const double omegaForward = colourOmegaEff;
-        const double omegaBackward = colourBackwardOmegaEff;
+        const double omegaForward = colourSpdMode ? 1.0 : colourOmegaEff;
+        const double omegaBackward = colourSpdMode ? 1.0 : colourBackwardOmegaEff;
 
         for (label colour = 0; colour < nColourSets; ++colour)
         {
@@ -2817,10 +6154,741 @@ using DeviceScalar = double;
         return true;
     };
 
+
     auto applyPreconditionerVec =
         [&](const double* rhs, double* out, const char* stage) -> bool
     {
+        auto scaleVector = [&](double* vec, const double* diag, const char* tag) -> bool
+        {
+            if (!diag)
+            {
+                return true;
+            }
+            if
+            (
+                cublasDdgmm
+                (
+                    cublasHandle,
+                    CUBLAS_SIDE_LEFT,
+                    rows,
+                    1,
+                    vec,
+                    rows,
+                    diag,
+                    1,
+                    vec,
+                    rows
+                ) != CUBLAS_STATUS_SUCCESS
+            )
+            {
+                message = word(tag);
+                return false;
+            }
+            return true;
+        };
+
+        const bool haveScaleVector =
+            (icUseDiagonalScaling || (icUseRuizScaling && preconCacheEntry && preconCacheEntry->ruizReady))
+         && preconCacheEntry && preconCacheEntry->d_invSqrtDiag;
+
+        auto solveIcInPlace = [&](double* vec) -> bool
+        {
+            if (!preconCacheEntry || !d_preTmp || !preIn || !preOut)
+            {
+                message = word("ICScaleMissing");
+                return false;
+            }
+
+            const bool usePermutation =
+                preconCacheEntry
+             && preconCacheEntry->permutationReady
+             && preconCacheEntry->d_perm;
+
+            if
+            (
+                preconCacheEntry
+             && std::fabs(preconCacheEntry->cachedMatvecSign - matvecSignD) > 0.5
+            )
+            {
+                message = word("ICCacheSignMismatch");
+                return false;
+            }
+
+            if (preconCacheEntry->icFactorValid)
+            {
+                const double cacheScale = preconCacheEntry->icFactorScale;
+                const double scaleTol =
+                    1e-8*std::max(std::max(std::fabs(cacheScale), std::fabs(factorScaleApplied)), 1.0);
+                if (std::fabs(cacheScale - factorScaleApplied) > scaleTol)
+                {
+                    message = word("ICCacheScaleMismatch");
+                    return false;
+                }
+            }
+
+            if (usePermutation)
+            {
+                const std::size_t cachePermId =
+                    preconCacheEntry ? preconCacheEntry->cachedPermutationId : std::size_t(0);
+                if (cachePermId != permutationId)
+                {
+                    message = word("ICCachePermutationMismatch");
+                    return false;
+                }
+                if (preconCacheEntry && !preconCacheEntry->permutationStructureValidated)
+                {
+                    message = word("ICPermutationStructureInvalid");
+                    return false;
+                }
+            }
+            else if
+            (
+                preconCacheEntry
+             && preconCacheEntry->cachedPermutationId != 0
+             && preconCacheEntry->permutationReady
+            )
+            {
+                message = word("ICPermutationUnexpected");
+                return false;
+            }
+
+            const bool logProbeEnabled =
+                (icDebugIterLog > 0)
+             && reportStats
+             && (!Pstream::parRun() || Pstream::master());
+
+            auto logProbeVec = [&](const char* tag, const double* devicePtr) -> bool
+            {
+                if (!logProbeEnabled)
+                {
+                    return true;
+                }
+                if (!devicePtr)
+                {
+                    if (reportStats && (!Pstream::parRun() || Pstream::master()))
+                    {
+                        WarningInFunction
+                            << "cudaPCG(" << fieldName_ << "): IC probe " << tag
+                            << " skipped (null device pointer)" << Foam::endl;
+                    }
+                    return true;
+                }
+                if (!syncStream())
+                {
+                    return false;
+                }
+                std::vector<double> hostVec(rows, 0.0);
+                const std::size_t bytes = static_cast<std::size_t>(rows)*sizeof(double);
+                if
+                (
+                    cudaMemcpy
+                    (
+                        hostVec.data(),
+                        devicePtr,
+                        bytes,
+                        cudaMemcpyDeviceToHost
+                    ) != cudaSuccess
+                )
+                {
+                    message = word("ICProbeCopyVec");
+                    return false;
+                }
+                double nrm2 = 0.0;
+                double maxAbs = 0.0;
+                for (double val : hostVec)
+                {
+                    nrm2 += val*val;
+                    maxAbs = std::max(maxAbs, std::fabs(val));
+                }
+                nrm2 = std::sqrt(std::max(nrm2, 0.0));
+                Info<< "cudaPCG(" << fieldName_ << "): IC probe " << tag
+                    << " nrm2=" << nrm2
+                    << " maxAbs=" << maxAbs << nl;
+                return true;
+            };
+
+            CUfunction permGatherKernel = nullptr;
+            CUfunction permScatterKernel = nullptr;
+
+            auto gatherPermutationVec =
+                [&](const double* inDev, double* outDev) -> bool
+            {
+                if (!usePermutation)
+                {
+                    if (inDev != outDev)
+                    {
+                        if
+                        (
+                            cudaMemcpy
+                            (
+                                outDev,
+                                inDev,
+                                sizeof(double)*rows,
+                                cudaMemcpyDeviceToDevice
+                            ) != cudaSuccess
+                        )
+                        {
+                            message = word("ICPermMemcpy");
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+                try
+                {
+                    if (!permGatherKernel)
+                    {
+                        if (!getPermutationKernels(deviceId, permGatherKernel, permScatterKernel, reportStats))
+                        {
+                            message = word("ICPermKernelCompile");
+                            return false;
+                        }
+                    }
+                    CUstream launchStream = computeStream ? reinterpret_cast<CUstream>(computeStream) : nullptr;
+                    if
+                    (
+                        !launchPermutationKernel
+                        (
+                            permGatherKernel,
+                            rows,
+                            reinterpret_cast<CUdeviceptr>(preconCacheEntry->d_perm),
+                            reinterpret_cast<CUdeviceptr>(const_cast<double*>(inDev)),
+                            reinterpret_cast<CUdeviceptr>(outDev),
+                            launchStream
+                        )
+                    )
+                    {
+                        message = word("ICPermGatherRun");
+                        return false;
+                    }
+                }
+                catch (...)
+                {
+                    message = word("ICPermGatherFail");
+                    return false;
+                }
+                return true;
+            };
+
+            auto scatterPermutationVec =
+                [&](const double* inDev, double* outDev) -> bool
+            {
+                if (!usePermutation)
+                {
+                    if (inDev != outDev)
+                    {
+                        if
+                        (
+                            cudaMemcpy
+                            (
+                                outDev,
+                                inDev,
+                                sizeof(double)*rows,
+                                cudaMemcpyDeviceToDevice
+                            ) != cudaSuccess
+                        )
+                        {
+                            message = word("ICPermMemcpy");
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+                try
+                {
+                    if (!permScatterKernel)
+                    {
+                        if (!getPermutationKernels(deviceId, permGatherKernel, permScatterKernel, reportStats))
+                        {
+                            message = word("ICPermKernelCompile");
+                            return false;
+                        }
+                    }
+                    CUstream launchStream = computeStream ? reinterpret_cast<CUstream>(computeStream) : nullptr;
+                    if
+                    (
+                        !launchPermutationKernel
+                        (
+                            permScatterKernel,
+                            rows,
+                            reinterpret_cast<CUdeviceptr>(preconCacheEntry->d_perm),
+                            reinterpret_cast<CUdeviceptr>(const_cast<double*>(inDev)),
+                            reinterpret_cast<CUdeviceptr>(outDev),
+                            launchStream
+                        )
+                    )
+                    {
+                        message = word("ICPermScatterRun");
+                        return false;
+                    }
+                }
+                catch (...)
+                {
+                    message = word("ICPermScatterFail");
+                    return false;
+                }
+                return true;
+            };
+
+            auto verifyPermutationRoundTrip = [&]() -> bool
+            {
+                if (!usePermutation || !preconCacheEntry)
+                {
+                    return true;
+                }
+                if (rows <= 0)
+                {
+                    preconCacheEntry->permutationValidated = true;
+                    return true;
+                }
+
+                std::vector<double> hostVec(rows, 0.0);
+                std::mt19937 rng(static_cast<unsigned>
+                    (
+                        permutationId
+                      ? permutationId
+                      : hashCombine(matrixPatternId, static_cast<std::size_t>(rows))
+                    ));
+                std::uniform_real_distribution<double> dist(-1.0, 1.0);
+                for (int i = 0; i < rows; ++i)
+                {
+                    hostVec[i] = dist(rng);
+                }
+
+                double* d_vec = nullptr;
+                double* d_tmp1 = nullptr;
+                double* d_tmp2 = nullptr;
+                auto cleanup = [&]()
+                {
+                    if (d_vec) { cudaFree(d_vec); d_vec = nullptr; }
+                    if (d_tmp1) { cudaFree(d_tmp1); d_tmp1 = nullptr; }
+                    if (d_tmp2) { cudaFree(d_tmp2); d_tmp2 = nullptr; }
+                };
+
+                const std::size_t bytes = static_cast<std::size_t>(rows)*sizeof(double);
+                if
+                (
+                    cudaMalloc(reinterpret_cast<void**>(&d_vec), bytes) != cudaSuccess
+                 || cudaMalloc(reinterpret_cast<void**>(&d_tmp1), bytes) != cudaSuccess
+                 || cudaMalloc(reinterpret_cast<void**>(&d_tmp2), bytes) != cudaSuccess
+                )
+                {
+                    cleanup();
+                    message = word("ICPermRoundTripAlloc");
+                    return false;
+                }
+
+                if
+                (
+                    cudaMemcpy
+                    (
+                        d_vec,
+                        hostVec.data(),
+                        bytes,
+                        cudaMemcpyHostToDevice
+                    ) != cudaSuccess
+                )
+                {
+                    cleanup();
+                    message = word("ICPermRoundTripCopyIn");
+                    return false;
+                }
+
+                if (!gatherPermutationVec(d_vec, d_tmp1))
+                {
+                    cleanup();
+                    return false;
+                }
+
+                std::vector<double> hostGather(rows, 0.0);
+                if
+                (
+                    cudaMemcpy
+                    (
+                        hostGather.data(),
+                        d_tmp1,
+                        bytes,
+                        cudaMemcpyDeviceToHost
+                    ) != cudaSuccess
+                )
+                {
+                    cleanup();
+                    message = word("ICPermRoundTripGatherCopy");
+                    return false;
+                }
+
+                std::vector<double> hostScatter(rows, 0.0);
+                if (!scatterPermutationVec(d_tmp1, d_tmp2))
+                {
+                    cleanup();
+                    return false;
+                }
+                if
+                (
+                    cudaMemcpy
+                    (
+                        hostScatter.data(),
+                        d_tmp2,
+                        bytes,
+                        cudaMemcpyDeviceToHost
+                    ) != cudaSuccess
+                )
+                {
+                    cleanup();
+                    message = word("ICPermRoundTripScatterCopy");
+                    return false;
+                }
+
+                if (!scatterPermutationVec(d_vec, d_tmp2))
+                {
+                    cleanup();
+                    return false;
+                }
+                if (!gatherPermutationVec(d_tmp2, d_tmp1))
+                {
+                    cleanup();
+                    return false;
+                }
+                std::vector<double> hostGatherBack(rows, 0.0);
+                if
+                (
+                    cudaMemcpy
+                    (
+                        hostGatherBack.data(),
+                        d_tmp1,
+                        bytes,
+                        cudaMemcpyDeviceToHost
+                    ) != cudaSuccess
+                )
+                {
+                    cleanup();
+                    message = word("ICPermRoundTripGatherBackCopy");
+                    return false;
+                }
+
+                cleanup();
+
+                double roundTripDiff = 0.0;
+                double scatterGatherDiff = 0.0;
+                double gatherNormSq = 0.0;
+                double originalNormSq = 0.0;
+                for (int i = 0; i < rows; ++i)
+                {
+                    roundTripDiff = std::max
+                    (
+                        roundTripDiff,
+                        std::fabs(hostScatter[i] - hostVec[i])
+                    );
+                    scatterGatherDiff = std::max
+                    (
+                        scatterGatherDiff,
+                        std::fabs(hostGatherBack[i] - hostVec[i])
+                    );
+                    gatherNormSq += hostGather[i]*hostGather[i];
+                    originalNormSq += hostVec[i]*hostVec[i];
+                }
+
+                const double gatherNorm = std::sqrt(std::max(gatherNormSq, 0.0));
+                const double originalNorm = std::sqrt(std::max(originalNormSq, 0.0));
+                const double normDiff = std::fabs(gatherNorm - originalNorm);
+
+                if
+                (
+                    roundTripDiff > 1e-12
+                 || scatterGatherDiff > 1e-12
+                 || normDiff > 1e-12
+                )
+                {
+                    if (reportStats && (!Pstream::parRun() || Pstream::master()))
+                    {
+                        WarningInFunction
+                            << "cudaPCG(" << fieldName_
+                            << "): permutation round-trip check failed "
+                            << "roundTripDiff=" << roundTripDiff
+                            << " scatterGatherDiff=" << scatterGatherDiff
+                            << " normDiff=" << normDiff << Foam::endl;
+                    }
+                    message = word("ICPermRoundTrip");
+                    return false;
+                }
+
+                preconCacheEntry->permutationValidated = true;
+                if (reportStats && (!Pstream::parRun() || Pstream::master()))
+                {
+                    Info<< "cudaPCG(" << fieldName_ << "): permutation round-trip max|Δ|="
+                        << roundTripDiff << " scatter∘gather max|Δ|=" << scatterGatherDiff
+                        << " normDiff=" << normDiff << nl;
+                }
+                return true;
+            };
+
+            if
+            (
+                usePermutation
+             && preconCacheEntry
+             && !preconCacheEntry->permutationValidated
+            )
+            {
+                if (!verifyPermutationRoundTrip())
+                {
+                    return false;
+                }
+            }
+
+            if (logProbeEnabled && !d_preTmp2)
+            {
+                const std::size_t probeBytes = static_cast<std::size_t>(rows)*sizeof(DeviceScalar);
+                if (cudaMalloc(reinterpret_cast<void**>(&d_preTmp2), probeBytes) != cudaSuccess)
+                {
+                    message = word("ICProbeTmpAlloc");
+                    return false;
+                }
+            }
+
+            if (logProbeEnabled)
+            {
+                if
+                (
+                    cublasDcopy
+                    (
+                        cublasHandle,
+                        rows,
+                        rhs,
+                        1,
+                        reinterpret_cast<double*>(d_preTmp),
+                        1
+                    ) != CUBLAS_STATUS_SUCCESS
+                )
+                {
+                    message = word("ICProbeCopy");
+                    return false;
+                }
+                if (!logProbeVec("r", reinterpret_cast<const double*>(d_preTmp)))
+                {
+                    return false;
+                }
+                if (haveScaleVector)
+                {
+                    if (!scaleVector(reinterpret_cast<double*>(d_preTmp), preconCacheEntry->d_invSqrtDiag, "ICProbeScaleIn"))
+                    {
+                        return false;
+                    }
+                }
+                if (!logProbeVec("S*r", reinterpret_cast<const double*>(d_preTmp)))
+                {
+                    return false;
+                }
+                cusparseDnVecSetValues(preIn, d_preTmp);
+                cusparseDnVecSetValues(preOut, d_preTmp2);
+                const double oneD = 1.0;
+                if
+                (
+                    cusparseSpSV_solve
+                    (
+                        cusparseHandle,
+                        CUSPARSE_OPERATION_NON_TRANSPOSE,
+                        &oneD,
+                        matLchol,
+                        preIn,
+                        preOut,
+                        CUDA_R_64F,
+                        CUSPARSE_SPSV_ALG_DEFAULT,
+                        spsvLowerChol
+                    ) != CUSPARSE_STATUS_SUCCESS
+                )
+                {
+                    message = word("ICProbeForwardFail");
+                    return false;
+                }
+                if (!logProbeVec("L^-1(S*r)", reinterpret_cast<const double*>(d_preTmp2)))
+                {
+                    return false;
+                }
+                cusparseDnVecSetValues(preIn, d_preTmp2);
+                cusparseDnVecSetValues(preOut, d_preTmp);
+                if
+                (
+                    cusparseSpSV_solve
+                    (
+                        cusparseHandle,
+                        CUSPARSE_OPERATION_TRANSPOSE,
+                        &oneD,
+                        matLchol,
+                        preIn,
+                        preOut,
+                        CUDA_R_64F,
+                        CUSPARSE_SPSV_ALG_DEFAULT,
+                        spsvUpperTChol
+                    ) != CUSPARSE_STATUS_SUCCESS
+                )
+                {
+                    message = word("ICProbeBackwardFail");
+                    return false;
+                }
+                if (!logProbeVec("L^-T L^-1(S*r)", reinterpret_cast<const double*>(d_preTmp)))
+                {
+                    return false;
+                }
+                if (haveScaleVector)
+                {
+                    if (!scaleVector(reinterpret_cast<double*>(d_preTmp), preconCacheEntry->d_invSqrtDiag, "ICProbeScaleOut"))
+                    {
+                        return false;
+                    }
+                }
+                if (!logProbeVec("zProbe", reinterpret_cast<const double*>(d_preTmp)))
+                {
+                    return false;
+                }
+            }
+
+            double* vecDouble = reinterpret_cast<double*>(vec);
+            double* tmpBuffer = reinterpret_cast<double*>(d_preTmp);
+            double* tmpBuffer2 = reinterpret_cast<double*>(d_preTmp2);
+
+            if (haveScaleVector)
+            {
+                if (!scaleVector(vec, preconCacheEntry->d_invSqrtDiag, "ICScaleInFail"))
+                {
+                    return false;
+                }
+            }
+
+            double* solveInput = vecDouble;
+            double* solveTmp = tmpBuffer2;
+
+            if (usePermutation)
+            {
+                if (!gatherPermutationVec(vecDouble, tmpBuffer))
+                {
+                    return false;
+                }
+                solveInput = tmpBuffer;
+                solveTmp = tmpBuffer2;
+            }
+            else
+            {
+                solveInput = vecDouble;
+                solveTmp = tmpBuffer;
+            }
+
+            cusparseDnVecSetValues(preIn, solveInput);
+            cusparseDnVecSetValues(preOut, solveTmp);
+            const double oneD = 1.0;
+            if
+            (
+                cusparseSpSV_solve
+                (
+                    cusparseHandle,
+                    CUSPARSE_OPERATION_NON_TRANSPOSE,
+                    &oneD,
+                    matLchol,
+                    preIn,
+                    preOut,
+                    CUDA_R_64F,
+                    CUSPARSE_SPSV_ALG_DEFAULT,
+                    spsvLowerChol
+                ) != CUSPARSE_STATUS_SUCCESS
+            )
+            {
+                message = word("ICLowerFail");
+                return false;
+            }
+
+            cusparseDnVecSetValues(preIn, solveTmp);
+            cusparseDnVecSetValues(preOut, solveInput);
+            if
+            (
+                cusparseSpSV_solve
+                (
+                    cusparseHandle,
+                    CUSPARSE_OPERATION_TRANSPOSE,
+                    &oneD,
+                    matLchol,
+                    preIn,
+                    preOut,
+                    CUDA_R_64F,
+                    CUSPARSE_SPSV_ALG_DEFAULT,
+                    spsvUpperTChol
+                ) != CUSPARSE_STATUS_SUCCESS
+            )
+            {
+                message = word("ICUpperTFail");
+                return false;
+            }
+
+            if (usePermutation)
+            {
+                if (!scatterPermutationVec(solveInput, vecDouble))
+                {
+                    return false;
+                }
+            }
+            else if (solveInput != vecDouble)
+            {
+                if
+                (
+                    cudaMemcpy
+                    (
+                        vecDouble,
+                        solveInput,
+                        sizeof(double)*rows,
+                        cudaMemcpyDeviceToDevice
+                    ) != cudaSuccess
+                )
+                {
+                    message = word("ICPermMemcpy");
+                    return false;
+                }
+            }
+
+            if (haveScaleVector)
+            {
+                if (!scaleVector(vec, preconCacheEntry->d_invSqrtDiag, "ICScaleOutFail"))
+                {
+                    return false;
+                }
+            }
+
+            const double applyScale =
+                preconCacheEntry ? preconCacheEntry->icApplyScale : 1.0;
+            if (std::fabs(applyScale - 1.0) > 1e-12)
+            {
+                if (cublasDscal(cublasHandle, rows, &applyScale, vec, 1) != CUBLAS_STATUS_SUCCESS)
+                {
+                    message = word("ICApplyScaleFail");
+                    return false;
+                }
+            }
+
+            icAppliedThisSolve = true;
+            return true;
+        };
         (void)stage;
+        if (useChebyshev)
+        {
+            if (chebyshevDegree <= 0)
+            {
+                message = word("ChebDegreeInvalid");
+                return false;
+            }
+            if (!applyChebyshevSpd(rhs, out))
+            {
+                if (chebyshevGuardrailTriggered)
+                {
+                    useChebyshev = false;
+                    colourSpdMode = true;
+                    useColour = true;
+                    if (applyColourDevice(rhs, out, "chebGuard"))
+                    {
+                        return true;
+                    }
+                    return applyDiagonalDevice(rhs, out);
+                }
+                return false;
+            }
+            return true;
+        }
         if (usePolyJacobi)
         {
             // out = omega*D^{-1} rhs
@@ -2886,7 +6954,6 @@ using DeviceScalar = double;
                 { message = word("PolySpMVFail"); return false; }
                 if (computeStream && cudaStreamSynchronize(computeStream) != cudaSuccess)
                 { message = word("PolyStreamSyncFail"); return false; }
-
                 // d_preTmp = rhs - t
                 if (cublasDcopy(cublasHandle, rows, rhs, 1, d_preTmp, 1) != CUBLAS_STATUS_SUCCESS)
                 {
@@ -2937,16 +7004,109 @@ using DeviceScalar = double;
             // No descriptor state to restore when using transient DnVecs
             return true;
         }
+        else if (useAmg)
+        {
+            if (!preconCacheEntry)
+            {
+                return fail("amgCacheMissing");
+            }
+
+            if (preconCacheEntry->amgHostR.size() != rows)
+            {
+                preconCacheEntry->amgHostR.setSize(rows);
+            }
+            if (preconCacheEntry->amgHostZ.size() != rows)
+            {
+                preconCacheEntry->amgHostZ.setSize(rows);
+            }
+
+            if
+            (
+                cudaMemcpy
+                (
+                    preconCacheEntry->amgHostR.begin(),
+                    rhs,
+                    sizeof(double)*rows,
+                    cudaMemcpyDeviceToHost
+                ) != cudaSuccess
+            )
+            {
+                message = word("amgCopyToHost");
+                return false;
+            }
+            preconCacheEntry->amgHostZ = 0.0;
+
+            if (!preconCacheEntry->amgSolver.valid())
+            {
+                IStringStream amgStream
+                (
+                    "{\n"
+                    "    solver GAMG;\n"
+                    "    tolerance 1e-3;\n"
+                    "    relTol 0;\n"
+                    "    smoother DICGaussSeidel;\n"
+                    "    nPreSweeps 1;\n"
+                    "    nPostSweeps 1;\n"
+                    "    cacheAgglomeration true;\n"
+                    "}\n"
+                );
+                dictionary amgSolverDict(amgStream());
+
+                auto setupStart = std::chrono::steady_clock::now();
+                preconCacheEntry->amgSolver = lduMatrix::solver::New
+                (
+                    fieldName_,
+                    matrix_,
+                    interfaceBouCoeffs_,
+                    interfaceIntCoeffs_,
+                    interfaces_,
+                    amgSolverDict
+                );
+                auto setupEnd = std::chrono::steady_clock::now();
+                const double setupMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(setupEnd - setupStart).count();
+                preconCacheEntry->amgSetupMs += setupMs;
+                amgSetupMsTotal += setupMs;
+            }
+
+            auto applyStart = std::chrono::steady_clock::now();
+            solverPerformance amgPerf =
+                preconCacheEntry->amgSolver->solve
+                (
+                    preconCacheEntry->amgHostZ,
+                    preconCacheEntry->amgHostR,
+                    cmpt
+                );
+            (void)amgPerf;
+            auto applyEnd = std::chrono::steady_clock::now();
+            const double applyMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(applyEnd - applyStart).count();
+            ++preconCacheEntry->amgApplyCount;
+            preconCacheEntry->amgApplyMs += applyMs;
+            ++amgApplyCountTotal;
+            amgApplyMsTotal += applyMs;
+
+            if
+            (
+                cudaMemcpy
+                (
+                    out,
+                    preconCacheEntry->amgHostZ.begin(),
+                    sizeof(double)*rows,
+                    cudaMemcpyHostToDevice
+                ) != cudaSuccess
+            )
+            {
+                message = word("amgCopyToDevice");
+                return false;
+            }
+
+            return true;
+        }
         else if (useComposite && icReady && (colourOperational && colourReady))
         {
             // Composite: a few coloured sweeps, then IC0
             const label sweeps = std::max<label>(1, dict.lookupOrDefault<label>("compositeColourSweeps", 2));
-            // First sweep: rhs -> out
-            if (!applyColourDevice(rhs, out, "compColour1"))
-            {
-                // If colour failed, fall back to IC only
-            }
-            else
+            bool colourOk = applyColourDevice(rhs, out, "compColour1");
+            if (colourOk)
             {
                 // Additional sweeps in-place on 'out'
                 for (label s = 1; s < sweeps; ++s)
@@ -2957,104 +7117,32 @@ using DeviceScalar = double;
                     }
                 }
             }
-            // Apply IC on the (possibly smoothed) vector in 'out'
-            const double oneD = 1.0;
-            cusparseDnVecSetValues(preIn, out);
-            cusparseDnVecSetValues(preOut, d_preTmp);
-            if
-            (
-                cusparseSpSV_solve
-                (
-                    cusparseHandle,
-                    CUSPARSE_OPERATION_NON_TRANSPOSE,
-                    &oneD,
-                    matLchol,
-                    preIn,
-                    preOut,
-                    CUDA_R_64F,
-                    CUSPARSE_SPSV_ALG_DEFAULT,
-                    spsvLowerChol
-                ) != CUSPARSE_STATUS_SUCCESS
-            )
+            else
             {
-                message = word("ICLowerFail");
-                return false;
+                if (cublasDcopy(cublasHandle, rows, rhs, 1, out, 1) != CUBLAS_STATUS_SUCCESS)
+                {
+                    message = word("ICCopyFail");
+                    return false;
+                }
             }
-            cusparseDnVecSetValues(preIn, d_preTmp);
-            cusparseDnVecSetValues(preOut, out);
-            if
-            (
-                cusparseSpSV_solve
-                (
-                    cusparseHandle,
-                    CUSPARSE_OPERATION_TRANSPOSE,
-                    &oneD,
-                    matLchol,
-                    preIn,
-                    preOut,
-                    CUDA_R_64F,
-                    CUSPARSE_SPSV_ALG_DEFAULT,
-                    spsvUpperTChol
-                ) != CUSPARSE_STATUS_SUCCESS
-            )
+            if (!solveIcInPlace(out))
             {
-                message = word("ICUpperTFail");
                 return false;
             }
             return true;
         }
         else if (icReady)
         {
-            // Incomplete Cholesky: solve L y = rhs; solve L^T out = y
-            const double oneD = 1.0;
             if (cublasDcopy(cublasHandle, rows, rhs, 1, out, 1) != CUBLAS_STATUS_SUCCESS)
             {
                 message = word("ICCopyFail");
                 return false;
             }
-            cusparseDnVecSetValues(preIn, out);
-            cusparseDnVecSetValues(preOut, d_preTmp);
-            if
-            (
-                cusparseSpSV_solve
-                (
-                    cusparseHandle,
-                    CUSPARSE_OPERATION_NON_TRANSPOSE,
-                    &oneD,
-                    matLchol,
-                    preIn,
-                    preOut,
-                    CUDA_R_64F,
-                    CUSPARSE_SPSV_ALG_DEFAULT,
-                    spsvLowerChol
-                ) != CUSPARSE_STATUS_SUCCESS
-            )
-            {
-                message = word("ICLowerFail");
-                return false;
-            }
-            cusparseDnVecSetValues(preIn, d_preTmp);
-            cusparseDnVecSetValues(preOut, out);
-            if
-            (
-                cusparseSpSV_solve
-                (
-                    cusparseHandle,
-                    CUSPARSE_OPERATION_TRANSPOSE,
-                    &oneD,
-                    matLchol,
-                    preIn,
-                    preOut,
-                    CUDA_R_64F,
-                    CUSPARSE_SPSV_ALG_DEFAULT,
-                    spsvUpperTChol
-                ) != CUSPARSE_STATUS_SUCCESS
-            )
-            {
-                message = word("ICUpperTFail");
-                return false;
-            }
-            return true;
+            return solveIcInPlace(out);
+        }
+        else if (icForced)
+        {
+            return applyDiagonalDevice(rhs, out);
         }
         else if (iluReady)
         {
@@ -3225,14 +7313,89 @@ using DeviceScalar = double;
         {
             Info<< "cudaPCG(" << fieldName_ << "): IC0 preconditioner "
                 << (icReady ? "active" : "disabled")
+                << (icForced ? " [forced]" : "")
                 << (icReady ? "" : (std::string(" (") + (iluDisableReason.size()?iluDisableReason:"buildFailure") + ")"))
+                << " matvecSign=" << matvecSign
+                << " cacheId=" << (preconCacheEntry ? preconCacheEntry->icCacheKeyId : 0)
                 << nl;
+            if (icCacheWasAllowed && preconCacheEntry)
+            {
+                Info<< "cudaPCG(" << fieldName_ << "): IC cache id="
+                    << preconCacheEntry->icCacheKeyId
+                    << " analysisReuse=" << preconCacheEntry->icAnalysisReuseHits
+                    << " factorReuse=" << preconCacheEntry->icFactorReuseHits
+                    << " refactors=" << preconCacheEntry->icRefactorCount
+                    << " shiftCount=" << preconCacheEntry->icShiftCounter
+                    << " shiftCountSolve=" << icShiftAppliedSolve
+                    << " factorValid=" << (preconCacheEntry->icFactorValid ? "true" : "false")
+                    << " hadZeroPivot=" << (preconCacheEntry->icHadZeroPivot ? "true" : "false")
+                    << " rollingMedian=" << preconCacheEntry->icRollingMedian
+                    << " lastIterations=" << preconCacheEntry->icLastIterations << nl;
+                if (!preconCacheEntry->icShiftTrace.empty())
+                {
+                    Info<< "cudaPCG(" << fieldName_ << "): IC shift ladder ("
+                        << (icRefactorThisSolve ? "success" : "fail") << ") [";
+                    for (std::size_t i = 0; i < preconCacheEntry->icShiftTrace.size(); ++i)
+                    {
+                        if (i) Info<< ' ';
+                        Info<< '(' << preconCacheEntry->icShiftTrace[i].first
+                            << ',' << preconCacheEntry->icShiftTrace[i].second << ')';
+                    }
+                    Info<< ']' << nl;
+                }
+            }
+            else if (icShiftAppliedSolve > 0)
+            {
+                Info<< "cudaPCG(" << fieldName_ << "): IC zero-pivot shifts this solve="
+                    << icShiftAppliedSolve << nl;
+            }
+            if (icDotGuardTriggered || icEffectComputed)
+            {
+                Info<< "cudaPCG(" << fieldName_ << "): IC telemetry dotGuard="
+                    << (icDotGuardTriggered ? "true" : "false");
+                if (icEffectComputed)
+                {
+                    Info<< " effect0=" << icPrecondEffect0;
+                }
+                Info<< nl;
+            }
         }
+    }
+
+
+    if (chebyshevRestarted && reportStats)
+    {
+        Info<< "cudaPCG(" << fieldName_ << "): Chebyshev spectral window inflated x"
+            << chebyshevLambdaInflateUsed
+            << " lambdaMin=" << chebyshevLambdaMinUsed
+            << " lambdaMax=" << chebyshevLambdaMaxUsed << nl;
+    }
+
+    if (chebyshevGuardrailTriggered && reportStats)
+    {
+        std::string guardReason = " (residual growth)";
+        if (chebyshevDotGuardTriggered)
+        {
+            guardReason = " (chebSpdDotGuard)";
+        }
+        else if (chebyshevClampGuardTriggered)
+        {
+            guardReason = " (invSqrtClamp)";
+        }
+        Info<< "cudaPCG(" << fieldName_ << "): Chebyshev guardrail engaged"
+            << guardReason << nl;
+    }
+
+    if (chebyshevSpdApplied && reportStats)
+    {
+        Info<< "cudaPCG(" << fieldName_ << "): Chebyshev SPD applied degree="
+            << chebyshevDegreeUsed
+            << " lambdaMin=" << chebyshevLambdaMinUsed
+            << " lambdaMax=" << chebyshevLambdaMaxUsed << nl;
     }
 
     const double alpha = 1.0;
     const double zero = 0.0;
-    const double negOne = -1.0;
 
     size_t bufferSize = 0;
     if
@@ -3418,20 +7581,88 @@ using DeviceScalar = double;
 
     if (cublasDcopy(cublasHandle, rows, reinterpret_cast<const double*>(d_b), 1, reinterpret_cast<double*>(d_r), 1) != CUBLAS_STATUS_SUCCESS)
         return fail("cublas copy b->r");
-    if (cublasDaxpy(cublasHandle, rows, reinterpret_cast<const double*>(&negOne), reinterpret_cast<const double*>(d_Ap), 1, reinterpret_cast<double*>(d_r), 1) != CUBLAS_STATUS_SUCCESS)
+    const double negOne = -1.0;
+    if (cublasDaxpy(cublasHandle, rows, &negOne, reinterpret_cast<const double*>(d_Ap), 1, reinterpret_cast<double*>(d_r), 1) != CUBLAS_STATUS_SUCCESS)
         return fail("cublas axpy r -= Ap");
 
     if (!applyPreconditionerVec(reinterpret_cast<const double*>(d_r), reinterpret_cast<double*>(d_z), "initial"))
         return fail(message);
+
+    double rNormInitial = 0.0;
+    double zNormInitial = 0.0;
+    if (icAppliedThisSolve)
+    {
+        if (cublasDnrm2(cublasHandle, rows, reinterpret_cast<const double*>(d_r), 1, &rNormInitial) != CUBLAS_STATUS_SUCCESS)
+        {
+            cleanup();
+            return fail("cublas nrm2(r)");
+        }
+        if (cublasDnrm2(cublasHandle, rows, reinterpret_cast<const double*>(d_z), 1, &zNormInitial) != CUBLAS_STATUS_SUCCESS)
+        {
+            cleanup();
+            return fail("cublas nrm2(z)");
+        }
+        if (std::isfinite(rNormInitial) && std::isfinite(zNormInitial) && rNormInitial > 0.0)
+        {
+            icPrecondEffect0 = zNormInitial / rNormInitial;
+            icEffectComputed = std::isfinite(icPrecondEffect0);
+        }
+        else
+        {
+            icEffectComputed = false;
+        }
+    }
+
+    if (icAppliedThisSolve && icEffectComputed && icPrecondEffect0 > 0.0)
+    {
+        const double targetEffect =
+            std::max(1e-12, static_cast<double>(icNormalizeTargetEffectCfg));
+        double postScale = targetEffect / icPrecondEffect0;
+        const double postClampMin =
+            icNormalizeClampMinCfg > scalar(0)
+              ? static_cast<double>(icNormalizeClampMinCfg)
+              : 0.0;
+        const double postClampMax =
+            icNormalizeClampMaxCfg > scalar(0)
+              ? static_cast<double>(icNormalizeClampMaxCfg)
+              : std::numeric_limits<double>::infinity();
+        if (postClampMax > 0.0 && postScale > postClampMax)
+        {
+            postScale = postClampMax;
+        }
+        if (postClampMin > 0.0 && postScale < postClampMin)
+        {
+            postScale = postClampMin;
+        }
+
+        if (std::fabs(postScale - 1.0) > 1e-12)
+        {
+            if (cublasDscal(cublasHandle, rows, &postScale, reinterpret_cast<double*>(d_z), 1) != CUBLAS_STATUS_SUCCESS)
+            {
+                cleanup();
+                return fail("cublas scale(z)");
+            }
+        }
+        if (preconCacheEntry)
+        {
+            preconCacheEntry->icApplyScale = postScale;
+        }
+        if (reportStats && (!Pstream::parRun() || Pstream::master()))
+        {
+            Info<< "cudaPCG(" << fieldName_ << "): IC auto scale postFactor="
+                << postScale << " effect0=" << icPrecondEffect0 << nl;
+        }
+    }
+    else if (preconCacheEntry)
+    {
+        preconCacheEntry->icApplyScale = 1.0;
+    }
 
     if (cublasDcopy(cublasHandle, rows, reinterpret_cast<const double*>(d_z), 1, reinterpret_cast<double*>(d_p), 1) != CUBLAS_STATUS_SUCCESS)
         return fail("cublas copy z->p");
 
     scalarField wA(nCells, Zero);
     scalarField pA(nCells, Zero);
-
-    cudaMemcpy(wA.begin(), d_Ap, sizeof(DeviceScalar)*rows, cudaMemcpyDeviceToHost);
-    cudaMemcpy(pA.begin(), d_p, sizeof(DeviceScalar)*rows, cudaMemcpyDeviceToHost);
 
     double rzDevice = 0.0;
     if (cublasDdot(cublasHandle, rows, reinterpret_cast<const double*>(d_r), 1, reinterpret_cast<const double*>(d_z), 1, &rzDevice) != CUBLAS_STATUS_SUCCESS)
@@ -3444,6 +7675,60 @@ using DeviceScalar = double;
         return false;
     }
     scalar rz = returnReduce(static_cast<scalar>(rzDevice), sumOp<scalar>());
+
+    if (icAppliedThisSolve && reportStats)
+    {
+        Info<< "cudaPCG(" << fieldName_ << "): IC apply metrics rz=" << rz
+            << " rNorm0=" << rNormInitial << " zNorm0=" << zNormInitial << nl;
+    }
+
+    if (icAppliedThisSolve && (!std::isfinite(rz) || rz <= scalar(0)))
+    {
+        icDotGuardTriggered = true;
+        icEffectComputed = false;
+        icPrecondEffect0 = 0.0;
+        if (preconCacheEntry)
+        {
+            preconCacheEntry->icFactorValid = false;
+        }
+        useIC = false;
+        icReady = false;
+        useComposite = false;
+        icForced = false;
+        icAppliedThisSolve = false;
+        if (reportStats)
+        {
+            Info<< "cudaPCG(" << fieldName_ << "): IC dot guard triggered (rz=" << rz
+                << ", rNorm0=" << rNormInitial << ", zNorm0=" << zNormInitial << "), demoting to diagonal fallback" << nl;
+        }
+        if (!applyPreconditionerVec(reinterpret_cast<const double*>(d_r), reinterpret_cast<double*>(d_z), "icDotGuardFallback"))
+        {
+            return fail(message);
+        }
+        if (cublasDcopy(cublasHandle, rows, reinterpret_cast<const double*>(d_z), 1, reinterpret_cast<double*>(d_p), 1) != CUBLAS_STATUS_SUCCESS)
+        {
+            return fail("cublas copy z->p");
+        }
+        double rzDeviceFallback = 0.0;
+        if (cublasDdot(cublasHandle, rows, reinterpret_cast<const double*>(d_r), 1, reinterpret_cast<const double*>(d_z), 1, &rzDeviceFallback) != CUBLAS_STATUS_SUCCESS)
+        {
+            cleanup();
+            return fail("cublas dot(r,z) fallback");
+        }
+        if (!syncStream())
+        {
+            return false;
+        }
+        rz = returnReduce(static_cast<scalar>(rzDeviceFallback), sumOp<scalar>());
+        if (!std::isfinite(rz) || rz <= scalar(0))
+        {
+            message = word("ICDotGuardNonPos");
+            return fail(message);
+        }
+    }
+
+    cudaMemcpy(wA.begin(), d_Ap, sizeof(DeviceScalar)*rows, cudaMemcpyDeviceToHost);
+    cudaMemcpy(pA.begin(), d_p, sizeof(DeviceScalar)*rows, cudaMemcpyDeviceToHost);
 
     scalar normFactor = this->normFactor(psi, source, wA, pA);
 
@@ -3491,6 +7776,10 @@ using DeviceScalar = double;
             }
         }
         cleanup();
+        if (preconCacheEntry && icAppliedThisSolve && icCacheWasAllowed)
+        {
+            preconCacheEntry->recordIterations(solverPerf.nIterations());
+        }
         writeTelemetry(true, word::null);
         if (useColour && autoTuneEnabled(dict))
         {
@@ -3524,13 +7813,21 @@ using DeviceScalar = double;
             return fail("cusparseSetVec(Ap)");
         }
 
+        cudaStream_t launchStreamBase = computeStream ? computeStream : nullptr;
+        if (iter == 0)
+        {
+            if (cudaMemsetAsync(d_Ap, 0, sizeof(DeviceScalar)*rows, launchStreamBase) != cudaSuccess)
+            {
+                return fail("cudaMemset(Ap)");
+            }
+        }
+
         bool launchedFromGraph = false;
         if (useCudaGraph)
         {
-            cudaStream_t activeStream = computeStream ? computeStream : nullptr;
             if (!spmvGraphReady && iter >= cudaGraphWarmup)
             {
-                if (cudaStreamBeginCapture(activeStream, cudaStreamCaptureModeGlobal) != cudaSuccess)
+                if (cudaStreamBeginCapture(launchStreamBase, cudaStreamCaptureModeGlobal) != cudaSuccess)
                 {
                     return fail("cudaStreamBeginCapture");
                 }
@@ -3550,10 +7847,10 @@ using DeviceScalar = double;
                     );
                 if (capStatus != CUSPARSE_STATUS_SUCCESS)
                 {
-                    cudaStreamEndCapture(activeStream, &spmvGraph);
+                    cudaStreamEndCapture(launchStreamBase, &spmvGraph);
                     return fail("cusparseSpMV (capture)");
                 }
-                if (cudaStreamEndCapture(activeStream, &spmvGraph) != cudaSuccess)
+                if (cudaStreamEndCapture(launchStreamBase, &spmvGraph) != cudaSuccess)
                 {
                     return fail("cudaStreamEndCapture");
                 }
@@ -3562,7 +7859,7 @@ using DeviceScalar = double;
                     return fail("cudaGraphInstantiate");
                 }
                 spmvGraphReady = true;
-                if (cudaGraphLaunch(spmvGraphExec, activeStream) != cudaSuccess)
+                if (cudaGraphLaunch(spmvGraphExec, launchStreamBase) != cudaSuccess)
                 {
                     return fail("cudaGraphLaunch");
                 }
@@ -3570,8 +7867,7 @@ using DeviceScalar = double;
             }
             else if (spmvGraphReady)
             {
-                cudaStream_t launchStream = computeStream ? computeStream : nullptr;
-                if (cudaGraphLaunch(spmvGraphExec, launchStream) != cudaSuccess)
+                if (cudaGraphLaunch(spmvGraphExec, launchStreamBase) != cudaSuccess)
                 {
                     return fail("cudaGraphLaunch");
                 }
@@ -3606,35 +7902,210 @@ using DeviceScalar = double;
         {
             return false;
         }
-
         // Restore vecX to x for completeness
         cusparseDnVecSetValues(vecX, d_x);
         cusparseDnVecSetValues(vecY, d_Ap);
 
+        const bool logCgDebug =
+            (icDebugIterLog > 0)
+         && reportStats
+         && (iter < icDebugIterLog)
+         && (!Pstream::parRun() || Pstream::master());
+
+        scalar rTrDebug = 0;
+        scalar zTrDebug = 0;
+        scalar pTrDebug = 0;
+        scalar apTrDebug = 0;
+        if (logCgDebug)
+        {
+            double rTrDeviceDebug = 0.0;
+            if
+            (
+                cublasDdot
+                (
+                    cublasHandle,
+                    rows,
+                    reinterpret_cast<const double*>(d_r),
+                    1,
+                    reinterpret_cast<const double*>(d_r),
+                    1,
+                    &rTrDeviceDebug
+                ) != CUBLAS_STATUS_SUCCESS
+            )
+            {
+                cleanup();
+                return fail("cublas dot(r,r) debug");
+            }
+            if (!syncStream())
+            {
+                return false;
+            }
+            rTrDebug = returnReduce(static_cast<scalar>(rTrDeviceDebug), sumOp<scalar>());
+
+            double zTrDeviceDebug = 0.0;
+            if
+            (
+                cublasDdot
+                (
+                    cublasHandle,
+                    rows,
+                    reinterpret_cast<const double*>(d_z),
+                    1,
+                    reinterpret_cast<const double*>(d_z),
+                    1,
+                    &zTrDeviceDebug
+                ) != CUBLAS_STATUS_SUCCESS
+            )
+            {
+                cleanup();
+                return fail("cublas dot(z,z) debug");
+            }
+            if (!syncStream())
+            {
+                return false;
+            }
+            zTrDebug = returnReduce(static_cast<scalar>(zTrDeviceDebug), sumOp<scalar>());
+            double pTrDeviceDebug = 0.0;
+            if
+            (
+                cublasDdot
+                (
+                    cublasHandle,
+                    rows,
+                    reinterpret_cast<const double*>(d_p),
+                    1,
+                    reinterpret_cast<const double*>(d_p),
+                    1,
+                    &pTrDeviceDebug
+                ) != CUBLAS_STATUS_SUCCESS
+            )
+            {
+                cleanup();
+                return fail("cublas dot(p,p) debug");
+            }
+            if (!syncStream())
+            {
+                return false;
+            }
+            pTrDebug = returnReduce(static_cast<scalar>(pTrDeviceDebug), sumOp<scalar>());
+
+            double apTrDeviceDebug = 0.0;
+            if
+            (
+                cublasDdot
+                (
+                    cublasHandle,
+                    rows,
+                    reinterpret_cast<const double*>(d_Ap),
+                    1,
+                    reinterpret_cast<const double*>(d_Ap),
+                    1,
+                    &apTrDeviceDebug
+                ) != CUBLAS_STATUS_SUCCESS
+            )
+            {
+                cleanup();
+                return fail("cublas dot(Ap,Ap) debug");
+            }
+            if (!syncStream())
+            {
+                return false;
+            }
+            apTrDebug = returnReduce(static_cast<scalar>(apTrDeviceDebug), sumOp<scalar>());
+        }
+
         double pApDevice = 0.0;
         if (cublasDdot(cublasHandle, rows, reinterpret_cast<const double*>(d_p), 1, reinterpret_cast<const double*>(d_Ap), 1, &pApDevice) != CUBLAS_STATUS_SUCCESS)
         {
-            cleanup();
-            return fail("cublas dot(p,Ap)");
-        }
-        if (!syncStream())
-        {
-            return false;
-        }
-        scalar pAp = returnReduce(static_cast<scalar>(pApDevice), sumOp<scalar>());
+        cleanup();
+        return fail("cublas dot(p,Ap)");
+    }
+    if (!syncStream())
+    {
+        return false;
+    }
+    scalar pAp = returnReduce(static_cast<scalar>(pApDevice), sumOp<scalar>());
 
         if (solverPerf.checkSingularity(mag(pAp)/normFactor))
         {
             break;
         }
 
+        if (pAp == scalar(0))
+        {
+            return fail("pApZero");
+        }
+
         const scalar alphaStep = rz/pAp;
         const double alphaDevice = static_cast<double>(alphaStep);
-        const double negAlphaDevice = -alphaDevice;
+
+        if (logCgDebug)
+        {
+            const double rNorm = std::sqrt(std::max(0.0, static_cast<double>(rTrDebug)));
+            const double zNorm = std::sqrt(std::max(0.0, static_cast<double>(zTrDebug)));
+            const double pNorm = std::sqrt(std::max(0.0, static_cast<double>(pTrDebug)));
+            const double apNorm = std::sqrt(std::max(0.0, static_cast<double>(apTrDebug)));
+            std::vector<double> pHost(static_cast<std::size_t>(rows));
+            std::vector<double> apHost(static_cast<std::size_t>(rows));
+            if
+            (
+                cudaMemcpy
+                (
+                    pHost.data(),
+                    reinterpret_cast<const double*>(d_p),
+                    sizeof(DeviceScalar)*rows,
+                    cudaMemcpyDeviceToHost
+                ) != cudaSuccess
+             || cudaMemcpy
+                (
+                    apHost.data(),
+                    reinterpret_cast<const double*>(d_Ap),
+                    sizeof(DeviceScalar)*rows,
+                    cudaMemcpyDeviceToHost
+                ) != cudaSuccess
+            )
+            {
+                cleanup();
+                return fail("cudaMemcpy(host debug)");
+            }
+            double hostDot = 0.0;
+            double hostApNorm = 0.0;
+            for (int i = 0; i < rows; ++i)
+            {
+                hostDot += pHost[i]*apHost[i];
+                hostApNorm += apHost[i]*apHost[i];
+            }
+            hostApNorm = std::sqrt(std::max(0.0, hostApNorm));
+            const int sampleCount = std::min(rows, 8);
+            std::ostringstream apSampleStream;
+            apSampleStream.setf(std::ios::scientific);
+            apSampleStream.precision(3);
+            apSampleStream << '[';
+            for (int i = 0; i < sampleCount; ++i)
+            {
+                if (i) apSampleStream << ' ';
+                apSampleStream << apHost[i];
+            }
+            apSampleStream << ']';
+            Info<< "cudaPCG(" << fieldName_ << "): iter=" << iter
+                << " rTr=" << rTrDebug
+                << " rz=" << rz
+                << " |r|=" << rNorm
+                << " |z|=" << zNorm
+                << " |p|=" << pNorm
+                << " |Ap|=" << apNorm
+                << " pAp=" << pAp
+                << " host_pAp=" << hostDot
+                << " host|Ap|=" << hostApNorm
+                << " ApSample=" << apSampleStream.str()
+                << " alpha=" << alphaStep
+                << nl;
+        }
 
         if (cublasDaxpy(cublasHandle, rows, &alphaDevice, reinterpret_cast<const double*>(d_p), 1, reinterpret_cast<double*>(d_x), 1) != CUBLAS_STATUS_SUCCESS)
             return fail("cublas axpy x += alpha*p");
-        if (cublasDaxpy(cublasHandle, rows, &negAlphaDevice, reinterpret_cast<const double*>(d_Ap), 1, reinterpret_cast<double*>(d_r), 1) != CUBLAS_STATUS_SUCCESS)
+        const double negAlphaScaled = -alphaDevice;
+        if (cublasDaxpy(cublasHandle, rows, &negAlphaScaled, reinterpret_cast<const double*>(d_Ap), 1, reinterpret_cast<double*>(d_r), 1) != CUBLAS_STATUS_SUCCESS)
             return fail("cublas axpy r -= alpha*Ap");
 
         if (cublasDasum(cublasHandle, rows, reinterpret_cast<const double*>(d_r), 1, &sumAbsDevice) != CUBLAS_STATUS_SUCCESS)
@@ -3714,7 +8185,83 @@ using DeviceScalar = double;
                 }
             }
 
-            residualWindow.push_back(solverPerf.finalResidual());
+        if (useChebyshev)
+        {
+            const scalar currentResidual = solverPerf.finalResidual();
+            if (chebyshevPrevResidual > VSMALL)
+            {
+                if (currentResidual > scalar(1.5)*chebyshevPrevResidual)
+                {
+                    ++chebyshevGrowthCounter;
+                }
+                else
+                {
+                    chebyshevGrowthCounter = 0;
+                }
+
+                if (chebyshevGrowthCounter >= 3)
+                {
+                    if (!chebyshevRestartAttempted && preconCacheEntry)
+                    {
+                        chebyshevRestartAttempted = true;
+                        chebyshevRestarted = true;
+                        chebyshevGrowthCounter = 0;
+                        chebyshevPrevResidual = currentResidual;
+
+                        const double inflate = std::max(1.0, static_cast<double>(chebyshevLambdaInflate));
+                        chebyshevLambdaInflateUsed = static_cast<scalar>(inflate);
+                        if (preconCacheEntry->lambdaReady && inflate > 1.0)
+                        {
+                            preconCacheEntry->lambdaMax *= inflate;
+                            preconCacheEntry->lambdaMin /= inflate;
+                            if
+                            (
+                                !std::isfinite(preconCacheEntry->lambdaMax)
+                             || preconCacheEntry->lambdaMax <= VSMALL
+                            )
+                            {
+                                preconCacheEntry->lambdaMax = inflate;
+                            }
+                            preconCacheEntry->lambdaMin = std::max
+                            (
+                                preconCacheEntry->lambdaMin,
+                                static_cast<double>(chebyshevLambdaMinFloor)
+                            );
+                            if (preconCacheEntry->lambdaMin >= preconCacheEntry->lambdaMax)
+                            {
+                                preconCacheEntry->lambdaMin = 0.5*preconCacheEntry->lambdaMax;
+                            }
+                        }
+                        else if (preconCacheEntry)
+                        {
+                            preconCacheEntry->lambdaReady = false;
+                        }
+
+                        if (preconCacheEntry)
+                        {
+                            chebyshevLambdaMinUsed = static_cast<scalar>(preconCacheEntry->lambdaMin);
+                            chebyshevLambdaMaxUsed = static_cast<scalar>(preconCacheEntry->lambdaMax);
+                        }
+                    }
+                    else
+                    {
+                        chebyshevGuardrailTriggered = true;
+                        useChebyshev = false;
+                        colourSpdMode = true;
+                        useColour = true;
+                        chebyshevPrevResidual = -1;
+                        chebyshevGrowthCounter = 0;
+                    }
+                }
+            }
+            else
+            {
+                chebyshevGrowthCounter = 0;
+            }
+            chebyshevPrevResidual = currentResidual;
+        }
+
+        residualWindow.push_back(solverPerf.finalResidual());
             if (residualWindow.size() > static_cast<std::size_t>(stallBestWindow))
             {
                 residualWindow.pop_front();
@@ -3742,6 +8289,34 @@ using DeviceScalar = double;
         if (!applyPreconditionerVec(reinterpret_cast<const double*>(d_r), reinterpret_cast<double*>(d_z), "iter"))
             return fail(message);
 
+        scalar zTrAfterDebug = 0;
+        if (logCgDebug)
+        {
+            double zAfterDeviceDebug = 0.0;
+            if
+            (
+                cublasDdot
+                (
+                    cublasHandle,
+                    rows,
+                    reinterpret_cast<const double*>(d_z),
+                    1,
+                    reinterpret_cast<const double*>(d_z),
+                    1,
+                    &zAfterDeviceDebug
+                ) != CUBLAS_STATUS_SUCCESS
+            )
+            {
+                cleanup();
+                return fail("cublas dot(z,z) debugIter");
+            }
+            if (!syncStream())
+            {
+                return false;
+            }
+            zTrAfterDebug = returnReduce(static_cast<scalar>(zAfterDeviceDebug), sumOp<scalar>());
+        }
+
         double rzNewDevice = 0.0;
         if (cublasDdot(cublasHandle, rows, reinterpret_cast<const double*>(d_r), 1, reinterpret_cast<const double*>(d_z), 1, &rzNewDevice) != CUBLAS_STATUS_SUCCESS)
         {
@@ -3753,11 +8328,53 @@ using DeviceScalar = double;
             return false;
         }
 
+        scalar rzCandidate = returnReduce(static_cast<scalar>(rzNewDevice), sumOp<scalar>());
+        if (useChebyshev && (!std::isfinite(rzCandidate) || rzCandidate <= scalar(0)))
+        {
+            chebyshevGuardrailTriggered = true;
+            chebyshevDotGuardTriggered = true;
+            useChebyshev = false;
+            colourSpdMode = true;
+            useColour = true;
+            chebyshevPrevResidual = -1;
+            chebyshevGrowthCounter = 0;
+            if (!applyPreconditionerVec(reinterpret_cast<const double*>(d_r), reinterpret_cast<double*>(d_z), "chebDotGuard"))
+            {
+                return fail(message);
+            }
+            rzNewDevice = 0.0;
+            if (cublasDdot(cublasHandle, rows, reinterpret_cast<const double*>(d_r), 1, reinterpret_cast<const double*>(d_z), 1, &rzNewDevice) != CUBLAS_STATUS_SUCCESS)
+            {
+                cleanup();
+                return fail("cublas dot(r,z) chebGuard");
+            }
+            if (!syncStream())
+            {
+                return false;
+            }
+            rzCandidate = returnReduce(static_cast<scalar>(rzNewDevice), sumOp<scalar>());
+            if (!std::isfinite(rzCandidate) || rzCandidate <= scalar(0))
+            {
+                message = word("ChebDotGuardNonPos");
+                return fail(message);
+            }
+        }
+
         const scalar rzOld = rz;
-        rz = returnReduce(static_cast<scalar>(rzNewDevice), sumOp<scalar>());
+        rz = rzCandidate;
 
         const scalar betaStep = rzOld != 0 ? rz/rzOld : 0;
         const double betaDevice = static_cast<double>(betaStep);
+
+        if (logCgDebug)
+        {
+            const double zNormNew = std::sqrt(std::max(0.0, static_cast<double>(zTrAfterDebug)));
+            Info<< "cudaPCG(" << fieldName_ << "): iter=" << iter
+                << " newRz=" << rz
+                << " beta=" << betaStep
+                << " |z_new|=" << zNormNew
+                << nl;
+        }
 
         if (usePipelinedCG)
         {
@@ -3765,7 +8382,7 @@ using DeviceScalar = double;
             {
                 return fail("cublas scal p*=beta");
             }
-            const double minusAlphaBetaDevice = -alphaDevice * betaDevice;
+        const double minusAlphaBetaDevice = -alphaDevice * betaDevice;
             if (cublasDaxpy(cublasHandle, rows, &minusAlphaBetaDevice, reinterpret_cast<const double*>(d_Ap), 1, reinterpret_cast<double*>(d_p), 1) != CUBLAS_STATUS_SUCCESS)
             {
                 return fail("cublas axpy p-=alphaBetaAp");
@@ -3807,6 +8424,31 @@ using DeviceScalar = double;
             psi[i] = static_cast<scalar>(static_cast<double>(psi[i]) * static_cast<double>(scaleHost[i]));
         }
     }
+    {
+        scalarField rPhysical(nCells, Zero);
+        matrix_.Amul(wA, psi, interfaceBouCoeffs_, interfaces_, cmpt);
+        for (label cell = 0; cell < nCells; ++cell)
+        {
+            rPhysical[cell] = source[cell] - wA[cell];
+        }
+        scalar trueSumAbs = gSumMag(rPhysical, matrix_.mesh().comm());
+        if (!std::isfinite(static_cast<double>(trueSumAbs)))
+        {
+            cleanup();
+            return fail("physicalResidualNaN");
+        }
+        scalar trueResidual =
+            normFactor > VSMALL
+          ? trueSumAbs/normFactor
+          : scalar(0);
+        if (!std::isfinite(static_cast<double>(trueResidual)))
+        {
+            cleanup();
+            return fail("physicalResidualNaN");
+        }
+        solverPerf.finalResidual() = trueResidual;
+        bestResidualSoFar = min(bestResidualSoFar, solverPerf.finalResidual());
+    }
     cleanup();
     if (logResidualTrajectory)
     {
@@ -3820,6 +8462,10 @@ using DeviceScalar = double;
             residualValueHistory.push_back(solverPerf.finalResidual());
         }
     }
+    if (preconCacheEntry && icAppliedThisSolve && icCacheWasAllowed)
+    {
+        preconCacheEntry->recordIterations(solverPerf.nIterations());
+    }
     writeTelemetry(true, word::null);
     if (logIterationStats && Pstream::master())
     {
@@ -3829,6 +8475,9 @@ using DeviceScalar = double;
             << ", avgIter=" << avgIterSeconds << " s"
             << ", maxIter=" << iterationMaxSeconds << " s" << nl;
     }
+    (void)chebyshevRequested;
+    (void)chebyshevForced;
+
     if (useColour && autoTuneEnabled(dict))
     {
         colourAutoTuneRecordSuccess(fieldName_);
